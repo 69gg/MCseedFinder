@@ -1,0 +1,27 @@
+{
+  "version": "26.2",
+  "search": {
+    "start": 0,
+    "end": 1000000,
+    "results": 5,
+    "batch_size": 4096
+  },
+  "conditions": [
+    {
+      "type": "spawn_biome",
+      "any_of": ["plains", "forest"]
+    },
+    {
+      "type": "structure_near",
+      "any_of": ["village"],
+      "radius": 1024
+    },
+    {
+      "type": "structure_near",
+      "dimension": "nether",
+      "any_of": ["fortress", "bastion_remnant"],
+      "anchor": "nether_spawn",
+      "radius": 512
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "version": "26.2",
+  "search": {
+    "start": -100000,
+    "end": 100000,
+    "results": 3
+  },
+  "conditions": [
+    {
+      "type": "any",
+      "conditions": [
+        {
+          "type": "spawn_biome",
+          "any_of": ["cherry_grove"]
+        },
+        {
+          "type": "biome_near",
+          "dimension": "overworld",
+          "any_of": ["pale_garden"],
+          "radius": 512,
+          "y": 64
+        }
+      ]
+    },
+    {
+      "type": "structure_near",
+      "any_of": ["village", "trial_chambers"],
+      "radius": 768,
+      "min_count": 1
+    },
+    {
+      "type": "not",
+      "condition": {
+        "type": "structure_near",
+        "any_of": ["pillager_outpost"],
+        "radius": 256
+      }
+    }
+  ]
+}

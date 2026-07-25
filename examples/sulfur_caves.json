@@ -1,0 +1,19 @@
+{
+  "version": "26.2",
+  "search": {
+    "start": 0,
+    "end": 100000,
+    "results": 5
+  },
+  "conditions": [
+    {
+      "type": "biome_near",
+      "dimension": "overworld",
+      "any_of": ["sulfur_caves"],
+      "anchor": "spawn",
+      "radius": 1024,
+      "y_min": -64,
+      "y_max": 32
+    }
+  ]
+}
