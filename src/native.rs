@@ -29,6 +29,7 @@ struct RawPieceHit {
     z: i32,
     parent_x: i32,
     parent_z: i32,
+    eye_mask: i32,
     name: *const c_char,
 }
 
@@ -40,6 +41,7 @@ impl Default for RawPieceHit {
             z: 0,
             parent_x: 0,
             parent_z: 0,
+            eye_mask: -1,
             name: std::ptr::null(),
         }
     }
@@ -115,6 +117,13 @@ unsafe extern "C" {
         hit_capacity: usize,
         found: *mut c_ulonglong,
         limit_reached: *mut c_int,
+    ) -> c_int;
+
+    fn mcseed_nearest_stronghold_portal(
+        context: *mut RawContext,
+        anchor_x: c_int,
+        anchor_z: c_int,
+        hit: *mut RawPieceHit,
     ) -> c_int;
 }
 
@@ -193,6 +202,7 @@ pub struct NativePieceHit {
     pub name: String,
     pub position: Position,
     pub parent_position: Position,
+    pub eye_mask: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -369,21 +379,7 @@ impl NativeContext {
         let hits = raw_hits
             .into_iter()
             .take(stored)
-            .map(|hit| {
-                Ok(NativePieceHit {
-                    name: required_c_string(hit.name)?,
-                    position: Position {
-                        x: hit.x,
-                        y: (hit.y != i32::MIN).then_some(hit.y),
-                        z: hit.z,
-                    },
-                    parent_position: Position {
-                        x: hit.parent_x,
-                        y: None,
-                        z: hit.parent_z,
-                    },
-                })
-            })
+            .map(native_piece_hit)
             .collect::<Result<Vec<_>>>()?;
         Ok(PieceScanResult {
             found,
@@ -391,6 +387,41 @@ impl NativeContext {
             hits,
         })
     }
+
+    pub fn nearest_stronghold_portal(
+        &mut self,
+        anchor_x: i32,
+        anchor_z: i32,
+    ) -> Result<NativePieceHit> {
+        let mut raw_hit = RawPieceHit::default();
+        let status = unsafe {
+            mcseed_nearest_stronghold_portal(self.raw.as_ptr(), anchor_x, anchor_z, &mut raw_hit)
+        };
+        ensure_status(status, "定位最近要塞传送门房")?;
+        native_piece_hit(raw_hit)
+    }
+}
+
+fn native_piece_hit(hit: RawPieceHit) -> Result<NativePieceHit> {
+    let eye_mask = match hit.eye_mask {
+        -1 => None,
+        0..=0x0fff => Some(u16::try_from(hit.eye_mask).context("末地传送门眼框掩码无效")?),
+        value => bail!("末地传送门眼框掩码超出 12 位范围：{value}"),
+    };
+    Ok(NativePieceHit {
+        name: required_c_string(hit.name)?,
+        position: Position {
+            x: hit.x,
+            y: (hit.y != i32::MIN).then_some(hit.y),
+            z: hit.z,
+        },
+        parent_position: Position {
+            x: hit.parent_x,
+            y: None,
+            z: hit.parent_z,
+        },
+        eye_mask,
+    })
 }
 
 impl Drop for NativeContext {
@@ -690,6 +721,17 @@ mod tests {
             ),
             (272, 944)
         );
+
+        let portal = context
+            .nearest_stronghold_portal(-32, 0)
+            .expect("最近要塞传送门房");
+        assert_eq!(portal.name, "stronghold/portal_room");
+        assert_eq!(
+            (portal.parent_position.x, portal.parent_position.z),
+            (-204, -1692)
+        );
+        assert_eq!((portal.position.x, portal.position.z), (-196, -1728));
+        assert_eq!(portal.eye_mask, Some(0x030));
 
         let fossil = structure_by_name("nether_fossil").expect("下界化石注册项");
         let fossil_scan = context

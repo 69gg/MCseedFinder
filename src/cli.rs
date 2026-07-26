@@ -105,6 +105,10 @@ pub struct FilterArgs {
     /// STRUCTURE:PIECE[,PIECE]:RADIUS；例如 village:blacksmith:1024，可重复
     #[arg(long, alias = "substructure-near", value_name = "SPEC")]
     pub piece_near: Vec<String>,
+
+    /// 最近要塞传送门的已有眼数；例如 3 或 3..12，可重复
+    #[arg(long, alias = "end-portal-eyes", value_name = "EYES|MIN..MAX")]
+    pub stronghold_eyes: Vec<String>,
 }
 
 #[derive(Debug, Args)]

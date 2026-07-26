@@ -23,6 +23,7 @@ typedef struct McSeedPieceHit {
     int32_t z;
     int32_t parent_x;
     int32_t parent_z;
+    int32_t eye_mask;
     const char *name;
 } McSeedPieceHit;
 
@@ -104,6 +105,17 @@ int32_t mcseed_find_structure_pieces(
     size_t hit_capacity,
     uint64_t *found,
     int32_t *limit_reached
+);
+
+/**
+ * Find the stronghold selected by Eye of Ender locate logic from an anchor.
+ * The returned portal-room hit includes a 12-bit End Portal eye mask.
+ */
+int32_t mcseed_nearest_stronghold_portal(
+    McSeedContext *context,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    McSeedPieceHit *hit
 );
 
 #ifdef __cplusplus

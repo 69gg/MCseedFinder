@@ -1,0 +1,17 @@
+{
+  "version": "26.2",
+  "search": {
+    "random": true,
+    "random_seed": 20260726,
+    "max_attempts": 1000000,
+    "results": 5
+  },
+  "conditions": [
+    {
+      "type": "stronghold_eyes",
+      "anchor": "spawn",
+      "min_eyes": 3,
+      "max_eyes": 12
+    }
+  ]
+}

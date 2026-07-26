@@ -365,8 +365,8 @@ static void extendStrongholdPiece(StrongholdPieceEnv *env, Piece *piece) {
 int getStrongholdPieces(Piece *list, int n, int mc, uint64_t seed, int chunkX, int chunkZ) {
     static const int OLD_ROTATIONS[] = {2, 3, 0, 1};
 
-    int x = (chunkX << 4) + 2;
-    int z = (chunkZ << 4) + 2;
+    int x = (int)((int64_t)chunkX * 16 + 2);
+    int z = (int)((int64_t)chunkZ * 16 + 2);
 
     uint64_t rng;
     if (mc <= MC_1_12_2) {

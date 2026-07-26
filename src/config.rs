@@ -98,6 +98,16 @@ pub enum ConditionSpec {
         #[serde(default)]
         max_count: Option<u64>,
     },
+    StrongholdEyes {
+        #[serde(default)]
+        anchor: Option<AnchorSpec>,
+        #[serde(default)]
+        eyes: Option<u8>,
+        #[serde(default)]
+        min_eyes: Option<u8>,
+        #[serde(default)]
+        max_eyes: Option<u8>,
+    },
     All {
         conditions: Vec<ConditionSpec>,
     },
@@ -167,6 +177,11 @@ pub enum CompiledCondition {
         min_count: u64,
         max_count: Option<u64>,
     },
+    StrongholdEyes {
+        anchor: Anchor,
+        min_eyes: u8,
+        max_eyes: u8,
+    },
     All(Vec<CompiledCondition>),
     Any(Vec<CompiledCondition>),
     Not(Box<CompiledCondition>),
@@ -227,6 +242,7 @@ pub fn conditions_from_flags(
     biome_near: &[String],
     structure_near: &[String],
     piece_near: &[String],
+    stronghold_eyes: &[String],
 ) -> Result<Vec<ConditionSpec>> {
     let mut conditions = Vec::new();
     if !spawn_biomes.is_empty() {
@@ -241,6 +257,9 @@ pub fn conditions_from_flags(
     }
     for specification in piece_near {
         conditions.push(parse_piece_near(specification)?);
+    }
+    for specification in stronghold_eyes {
+        conditions.push(parse_stronghold_eyes(specification)?);
     }
     Ok(conditions)
 }
@@ -314,6 +333,31 @@ fn parse_piece_near(value: &str) -> Result<ConditionSpec> {
         min_count: default_min_count(),
         max_count: None,
     })
+}
+
+fn parse_stronghold_eyes(value: &str) -> Result<ConditionSpec> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("要塞眼数不能为空；应为 EYES 或 MIN..MAX");
+    }
+    if let Some((minimum, maximum)) = value.split_once("..") {
+        if minimum.is_empty() || maximum.is_empty() {
+            bail!("要塞眼数 {value:?} 格式错误；范围应为 MIN..MAX");
+        }
+        Ok(ConditionSpec::StrongholdEyes {
+            anchor: None,
+            eyes: None,
+            min_eyes: Some(parse_eye_count(minimum, value)?),
+            max_eyes: Some(parse_eye_count(maximum, value)?),
+        })
+    } else {
+        Ok(ConditionSpec::StrongholdEyes {
+            anchor: None,
+            eyes: Some(parse_eye_count(value, value)?),
+            min_eyes: None,
+            max_eyes: None,
+        })
+    }
 }
 
 fn compile_condition(specification: ConditionSpec) -> Result<CompiledCondition> {
@@ -416,6 +460,19 @@ fn compile_condition(specification: ConditionSpec) -> Result<CompiledCondition> 
                 radius,
                 min_count,
                 max_count,
+            })
+        }
+        ConditionSpec::StrongholdEyes {
+            anchor,
+            eyes,
+            min_eyes,
+            max_eyes,
+        } => {
+            let (min_eyes, max_eyes) = resolve_eye_range(eyes, min_eyes, max_eyes)?;
+            Ok(CompiledCondition::StrongholdEyes {
+                anchor: compile_anchor(anchor, Dimension::Overworld)?,
+                min_eyes,
+                max_eyes,
             })
         }
         ConditionSpec::All { conditions } => {
@@ -613,6 +670,41 @@ fn validate_counts(minimum: u64, maximum: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+fn parse_eye_count(value: &str, specification: &str) -> Result<u8> {
+    let count = value
+        .parse::<u8>()
+        .with_context(|| format!("要塞眼数 {specification:?} 中的 {value:?} 不是 0..12 的整数"))?;
+    if count > 12 {
+        bail!("要塞眼数不能超过 12，实际为 {count}");
+    }
+    Ok(count)
+}
+
+fn resolve_eye_range(
+    eyes: Option<u8>,
+    minimum: Option<u8>,
+    maximum: Option<u8>,
+) -> Result<(u8, u8)> {
+    if let Some(eyes) = eyes {
+        if minimum.is_some() || maximum.is_some() {
+            bail!("stronghold_eyes 不能同时设置 eyes 和 min_eyes/max_eyes");
+        }
+        if eyes > 12 {
+            bail!("要塞眼数不能超过 12，实际为 {eyes}");
+        }
+        return Ok((eyes, eyes));
+    }
+    let minimum = minimum.unwrap_or(0);
+    let maximum = maximum.unwrap_or(12);
+    if minimum > 12 || maximum > 12 {
+        bail!("要塞眼数范围必须位于 0..=12，实际为 {minimum}..={maximum}");
+    }
+    if maximum < minimum {
+        bail!("max_eyes ({maximum}) 不能小于 min_eyes ({minimum})");
+    }
+    Ok((minimum, maximum))
+}
+
 fn sort_by_cost(conditions: &mut [CompiledCondition]) {
     conditions.sort_by_key(condition_cost);
 }
@@ -634,6 +726,7 @@ fn condition_cost(condition: &CompiledCondition) -> u8 {
                 4
             }
         }
+        CompiledCondition::StrongholdEyes { .. } => 5,
         CompiledCondition::BiomeNear { .. } => 3,
         CompiledCondition::All(children) | CompiledCondition::Any(children) => {
             children.iter().map(condition_cost).min().unwrap_or(1)
@@ -697,24 +790,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_conflicting_stronghold_eye_fields() {
+        let file: FileConfig = serde_json::from_str(
+            r#"{"conditions":[{"type":"stronghold_eyes","eyes":2,"min_eyes":1}]}"#,
+        )
+        .expect("JSON 语法有效");
+        let error =
+            CompiledFilter::compile(file.conditions).expect_err("精确眼数和范围不能同时出现");
+        assert!(error.to_string().contains("不能同时设置"));
+    }
+
+    #[test]
     fn parses_common_cli_filters() {
         let specs = conditions_from_flags(
             &["plains,forest".to_owned()],
             &["nether:warped_forest,crimson_forest:256:32..96".to_owned()],
             &["village:512".to_owned(), "fortress,bastion:256".to_owned()],
             &["village:blacksmith,library:1024".to_owned()],
+            &["2..5".to_owned()],
         )
         .expect("CLI 条件应可解析");
         let filter = CompiledFilter::compile(specs).expect("条件应可编译");
         let CompiledCondition::All(conditions) = filter.root else {
             panic!("根条件应为 all");
         };
-        assert_eq!(conditions.len(), 5);
+        assert_eq!(conditions.len(), 6);
         assert!(conditions.iter().any(|condition| matches!(
             condition,
             CompiledCondition::StructureNear {
                 anchor: Anchor::NetherSpawn,
                 ..
+            }
+        )));
+        assert!(conditions.iter().any(|condition| matches!(
+            condition,
+            CompiledCondition::StrongholdEyes {
+                anchor: Anchor::Spawn,
+                min_eyes: 2,
+                max_eyes: 5,
             }
         )));
     }
@@ -727,6 +840,7 @@ mod tests {
             include_str!("../examples/sulfur_caves.json"),
             include_str!("../examples/random_search.json"),
             include_str!("../examples/village_blacksmith.json"),
+            include_str!("../examples/stronghold_eyes.json"),
         ];
         for json in examples {
             let file: FileConfig = serde_json::from_str(json).expect("示例 JSON 应有效");

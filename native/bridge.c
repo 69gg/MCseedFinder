@@ -20,6 +20,8 @@ enum {
     MCSEED_PIECE_BUFFER_CAPACITY = 1024,
     MCSEED_JIGSAW_BUFFER_CAPACITY = MCJIGSAW_PIECE_CAPACITY,
     MCSEED_TERRAIN_COLUMN_CACHE_SIZE = 256,
+    MCSEED_STRONGHOLD_COUNT = 128,
+    MCSEED_STRONGHOLD_LOCATE_MARGIN = 128,
 };
 
 enum {
@@ -1421,7 +1423,8 @@ static int store_piece_hit(
     int32_t x,
     int32_t y,
     int32_t z,
-    Pos parent
+    Pos parent,
+    int32_t eye_mask
 )
 {
     if (total < hit_capacity && hits) {
@@ -1430,6 +1433,7 @@ static int store_piece_hit(
         hits[total].z = z;
         hits[total].parent_x = parent.x;
         hits[total].parent_z = parent.z;
+        hits[total].eye_mask = eye_mask;
         hits[total].name = name;
     }
     return 1;
@@ -1482,7 +1486,8 @@ static int evaluate_piece_candidate(
                 piece->x,
                 piece->y,
                 piece->z,
-                parent
+                parent,
+                -1
             );
             (*total)++;
             if (*total >= limit)
@@ -1553,11 +1558,16 @@ static int evaluate_piece_candidate(
             const char *name = canonical_piece_name(info, piece, &variant);
             int32_t piece_x = piece->pos.x;
             int32_t piece_z = piece->pos.z;
+            int32_t eye_mask = -1;
             if (!name || !any_selector_matches(info->id, selectors, selector_count, name))
                 continue;
             if (info->cubiomes_type == Bastion) {
                 piece_x = parent.x;
                 piece_z = parent.z;
+            }
+            if (info->cubiomes_type == Stronghold &&
+                piece->type == SH_PORTAL_ROOM) {
+                eye_mask = piece->additionalData & 0x0fff;
             }
             store_piece_hit(
                 hits,
@@ -1567,7 +1577,8 @@ static int evaluate_piece_candidate(
                 piece_x,
                 INT32_MIN,
                 piece_z,
-                parent
+                parent,
+                eye_mask
             );
             (*total)++;
             if (*total >= limit)
@@ -1575,6 +1586,209 @@ static int evaluate_piece_candidate(
         }
     }
     return 0;
+}
+
+static uint64_t stronghold_locate_distance_squared(
+    Pos position,
+    int32_t anchor_x,
+    int32_t anchor_z
+)
+{
+    int64_t center_x = floor_div_i64(position.x, 16) * 16 + 8;
+    int64_t center_z = floor_div_i64(position.z, 16) * 16 + 8;
+    int64_t dx = center_x - anchor_x;
+    int64_t dz = center_z - anchor_z;
+    return (uint64_t)(dx * dx) + (uint64_t)(dz * dz);
+}
+
+static uint64_t stronghold_distance_bound_squared(
+    Pos position,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    int upper_bound
+)
+{
+    int64_t center_x = floor_div_i64(position.x, 16) * 16 + 8;
+    int64_t center_z = floor_div_i64(position.z, 16) * 16 + 8;
+    int64_t dx = center_x - anchor_x;
+    int64_t dz = center_z - anchor_z;
+    uint64_t absolute_dx = dx < 0 ? (uint64_t)(-dx) : (uint64_t)dx;
+    uint64_t absolute_dz = dz < 0 ? (uint64_t)(-dz) : (uint64_t)dz;
+    uint64_t bounded_dx;
+    uint64_t bounded_dz;
+    if (upper_bound) {
+        bounded_dx = absolute_dx + MCSEED_STRONGHOLD_LOCATE_MARGIN;
+        bounded_dz = absolute_dz + MCSEED_STRONGHOLD_LOCATE_MARGIN;
+    } else {
+        bounded_dx = absolute_dx > MCSEED_STRONGHOLD_LOCATE_MARGIN
+            ? absolute_dx - MCSEED_STRONGHOLD_LOCATE_MARGIN
+            : 0;
+        bounded_dz = absolute_dz > MCSEED_STRONGHOLD_LOCATE_MARGIN
+            ? absolute_dz - MCSEED_STRONGHOLD_LOCATE_MARGIN
+            : 0;
+    }
+    return bounded_dx * bounded_dx + bounded_dz * bounded_dz;
+}
+
+static int nearest_stronghold_position(
+    McSeedContext *context,
+    Generator *generator,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    Pos *nearest
+)
+{
+    Pos approximate[MCSEED_STRONGHOLD_COUNT];
+    StrongholdIter iterator;
+    uint64_t best_upper_bound = UINT64_MAX;
+    uint64_t best_distance = UINT64_MAX;
+    int approximate_count = 0;
+    int found = 0;
+    int index;
+
+    if (MCSEED_CUBIOMES_VERSION <= MC_1_19_2) {
+        initFirstStronghold(&iterator, MCSEED_CUBIOMES_VERSION, context->seed);
+        for (index = 0; index < MCSEED_STRONGHOLD_COUNT; index++) {
+            uint64_t distance;
+            if (nextStronghold(&iterator, generator) <= 0)
+                break;
+            distance = stronghold_locate_distance_squared(
+                iterator.pos,
+                anchor_x,
+                anchor_z
+            );
+            if (!found || distance < best_distance) {
+                *nearest = iterator.pos;
+                best_distance = distance;
+                found = 1;
+            }
+        }
+        return found;
+    }
+
+    /*
+     * Biome adjustment can move a stronghold by at most the locate search
+     * radius, plus chunk snapping. First collect cheap approximate positions
+     * so exact biome searches are limited to candidates whose bounding square
+     * can still beat the best possible upper bound.
+     */
+    initFirstStronghold(&iterator, MCSEED_CUBIOMES_VERSION, context->seed);
+    for (index = 0; index < MCSEED_STRONGHOLD_COUNT; index++) {
+        uint64_t upper_bound;
+        if (nextStronghold(&iterator, NULL) <= 0)
+            break;
+        approximate[approximate_count++] = iterator.pos;
+        upper_bound = stronghold_distance_bound_squared(
+            iterator.pos,
+            anchor_x,
+            anchor_z,
+            1
+        );
+        if (upper_bound < best_upper_bound)
+            best_upper_bound = upper_bound;
+    }
+
+    initFirstStronghold(&iterator, MCSEED_CUBIOMES_VERSION, context->seed);
+    for (index = 0; index < approximate_count; index++) {
+        uint64_t lower_bound = stronghold_distance_bound_squared(
+            approximate[index],
+            anchor_x,
+            anchor_z,
+            0
+        );
+        const Generator *candidate_generator =
+            lower_bound <= best_upper_bound && lower_bound <= best_distance
+            ? generator
+            : NULL;
+        uint64_t distance;
+        if (nextStronghold(&iterator, candidate_generator) <= 0)
+            break;
+        if (!candidate_generator)
+            continue;
+        distance = stronghold_locate_distance_squared(
+            iterator.pos,
+            anchor_x,
+            anchor_z
+        );
+        if (!found || distance < best_distance) {
+            *nearest = iterator.pos;
+            best_distance = distance;
+            found = 1;
+        }
+    }
+    return found;
+}
+
+int32_t mcseed_nearest_stronghold_portal(
+    McSeedContext *context,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    McSeedPieceHit *hit
+)
+{
+    Generator *generator;
+    StructureSaltConfig salt_config;
+    StructureVariant variant;
+    Pos nearest;
+    int count;
+    int index;
+    if (!context || !hit)
+        return -1;
+    memset(hit, 0, sizeof(*hit));
+    hit->y = INT32_MIN;
+    hit->eye_mask = -1;
+    generator = generator_for_dimension(context, DIM_OVERWORLD);
+    if (!generator)
+        return -2;
+    if (!nearest_stronghold_position(
+            context,
+            generator,
+            anchor_x,
+            anchor_z,
+            &nearest)) {
+        return -3;
+    }
+    memset(&salt_config, 0, sizeof(salt_config));
+    memset(&variant, 0, sizeof(variant));
+    variant.biome = -1;
+    if (!getStructureSaltConfig(
+            Stronghold,
+            MCSEED_CUBIOMES_VERSION,
+            variant.biome,
+            &salt_config)) {
+        return -4;
+    }
+    memset(
+        context->piece_buffer,
+        0,
+        MCSEED_PIECE_BUFFER_CAPACITY * sizeof(*context->piece_buffer)
+    );
+    count = getStructurePieces(
+        context->piece_buffer,
+        MCSEED_PIECE_BUFFER_CAPACITY,
+        Stronghold,
+        salt_config,
+        &variant,
+        MCSEED_CUBIOMES_VERSION,
+        context->seed,
+        nearest.x,
+        nearest.z
+    );
+    if (count < 0)
+        return -5;
+    for (index = 0; index < count; index++) {
+        const Piece *piece = &context->piece_buffer[index];
+        if (piece->type != SH_PORTAL_ROOM)
+            continue;
+        hit->x = piece->pos.x;
+        hit->z = piece->pos.z;
+        hit->parent_x = nearest.x;
+        hit->parent_z = nearest.z;
+        hit->eye_mask = piece->additionalData & 0x0fff;
+        hit->name = "stronghold/portal_room";
+        return 0;
+    }
+    return -6;
 }
 
 static int32_t find_stronghold_pieces(

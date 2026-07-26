@@ -133,6 +133,17 @@ int main(void)
     assert(hits[0].x == 272 && hits[0].z == 944);
 
     {
+        McSeedPieceHit portal;
+        assert(mcseed_nearest_stronghold_portal(
+            context, spawn.x, spawn.z, &portal
+        ) == 0);
+        assert(strcmp(portal.name, "stronghold/portal_room") == 0);
+        assert(portal.parent_x == -204 && portal.parent_z == -1692);
+        assert(portal.x == -196 && portal.y == INT32_MIN && portal.z == -1728);
+        assert(portal.eye_mask == 0x030);
+    }
+
+    {
         const char *selectors[] = {"blacksmith"};
         assert(mcseed_find_structure_pieces(
             context, village_id, selectors, 1, spawn.x, spawn.z, 1024,

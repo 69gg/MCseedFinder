@@ -86,9 +86,14 @@ fn write_condition(output: &mut impl Write, report: &ConditionReport, depth: usi
             .parent_position
             .map(|position| format!("；父结构起点 ({}, {})", position.x, position.z))
             .unwrap_or_default();
+        let eyes = hit
+            .eye_count
+            .zip(hit.eye_mask)
+            .map(|(count, mask)| format!("；已有末影之眼 {count}/12（mask={mask:#05x}）"))
+            .unwrap_or_default();
         writeln!(
             output,
-            "{indent}  - {} {} ({x}{y}, {z}){parent} 距离 {distance:.1}",
+            "{indent}  - {} {} ({x}{y}, {z}){parent}{eyes} 距离 {distance:.1}",
             hit.dimension,
             hit.name,
             x = hit.position.x,

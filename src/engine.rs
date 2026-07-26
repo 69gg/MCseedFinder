@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::config::{Anchor, CompiledCondition, CompiledFilter, MINECRAFT_VERSION};
 use crate::domain::{Dimension, Position, SpawnInfo, project_to_nether};
-use crate::native::{self, NativeContext, NativeHit};
+use crate::native::{self, NativeContext, NativeHit, NativePieceHit};
 
 pub const DEFAULT_START: i128 = 0;
 pub const DEFAULT_END: i128 = 1_000_000;
@@ -128,6 +128,10 @@ pub struct HitReport {
     pub position: Position,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_position: Option<Position>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eye_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eye_mask: Option<u16>,
     pub distance: f64,
 }
 
@@ -190,6 +194,7 @@ enum WorkerReply {
 struct Evaluation<'a> {
     native: &'a mut NativeContext,
     spawn: Option<SpawnInfo>,
+    stronghold_portals: Vec<(i32, i32, NativePieceHit)>,
 }
 
 struct ConditionOutcome {
@@ -369,6 +374,7 @@ impl<'a> Evaluation<'a> {
         Self {
             native,
             spawn: None,
+            stronghold_portals: Vec::new(),
         }
     }
 
@@ -488,6 +494,8 @@ impl<'a> Evaluation<'a> {
                             dimension: *dimension,
                             position: hit.position,
                             parent_position: None,
+                            eye_count: None,
+                            eye_mask: None,
                             distance: horizontal_distance(
                                 hit.position.x,
                                 hit.position.z,
@@ -557,6 +565,8 @@ impl<'a> Evaluation<'a> {
                             dimension: parent.dimension,
                             position: hit.position,
                             parent_position: Some(hit.parent_position),
+                            eye_count: hit.eye_mask.map(|mask| mask.count_ones() as u8),
+                            eye_mask: hit.eye_mask,
                             distance: horizontal_distance(
                                 hit.parent_position.x,
                                 hit.parent_position.z,
@@ -565,6 +575,45 @@ impl<'a> Evaluation<'a> {
                             ),
                         })
                         .collect(),
+                    children: Vec::new(),
+                });
+                Ok(ConditionOutcome { matched, report })
+            }
+            CompiledCondition::StrongholdEyes {
+                anchor,
+                min_eyes,
+                max_eyes,
+            } => {
+                let (anchor_x, anchor_z) = self.resolve_anchor(*anchor)?;
+                let hit = self.stronghold_portal(anchor_x, anchor_z)?;
+                let eye_mask = hit
+                    .eye_mask
+                    .ok_or_else(|| anyhow!("最近要塞传送门房没有返回眼框掩码"))?;
+                let eye_count = eye_mask.count_ones() as u8;
+                let matched = eye_count >= *min_eyes && eye_count <= *max_eyes;
+                let report = collect.then(|| ConditionReport {
+                    condition: "stronghold_eyes".to_owned(),
+                    matched,
+                    description: format!(
+                        "末影之眼从 {} ({anchor_x}, {anchor_z}) 定位的最近要塞传送门已有 {eye_count}/12 颗眼；要求 {min_eyes}..={max_eyes} 颗",
+                        anchor.label()
+                    ),
+                    observed_count: Some(u64::from(eye_count)),
+                    count_is_lower_bound: false,
+                    hits: vec![HitReport {
+                        name: hit.name,
+                        dimension: Dimension::Overworld,
+                        position: hit.position,
+                        parent_position: Some(hit.parent_position),
+                        eye_count: Some(eye_count),
+                        eye_mask: Some(eye_mask),
+                        distance: horizontal_distance(
+                            hit.parent_position.x,
+                            hit.parent_position.z,
+                            anchor_x,
+                            anchor_z,
+                        ),
+                    }],
                     children: Vec::new(),
                 });
                 Ok(ConditionOutcome { matched, report })
@@ -643,6 +692,20 @@ impl<'a> Evaluation<'a> {
             .ok_or_else(|| anyhow!("内部错误：出生点缓存为空"))
     }
 
+    fn stronghold_portal(&mut self, anchor_x: i32, anchor_z: i32) -> Result<NativePieceHit> {
+        if let Some((_, _, hit)) = self
+            .stronghold_portals
+            .iter()
+            .find(|(x, z, _)| *x == anchor_x && *z == anchor_z)
+        {
+            return Ok(hit.clone());
+        }
+        let hit = self.native.nearest_stronghold_portal(anchor_x, anchor_z)?;
+        self.stronghold_portals
+            .push((anchor_x, anchor_z, hit.clone()));
+        Ok(hit)
+    }
+
     fn resolve_anchor(&mut self, anchor: Anchor) -> Result<(i32, i32)> {
         match anchor {
             Anchor::Origin => Ok((0, 0)),
@@ -694,6 +757,8 @@ fn biome_hit(dimension: Dimension, hit: &NativeHit, anchor_x: i32, anchor_z: i32
         dimension,
         position: hit.position,
         parent_position: None,
+        eye_count: None,
+        eye_mask: None,
         distance: horizontal_distance(hit.position.x, hit.position.z, anchor_x, anchor_z),
     }
 }

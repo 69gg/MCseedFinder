@@ -122,6 +122,7 @@ fn load_filter(arguments: &FilterArgs) -> Result<(FileConfig, CompiledFilter)> {
         &arguments.biome_near,
         &arguments.structure_near,
         &arguments.piece_near,
+        &arguments.stronghold_eyes,
     )?);
     let filter = CompiledFilter::compile(file.conditions.clone())?;
     Ok((file, filter))

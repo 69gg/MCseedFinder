@@ -79,6 +79,37 @@ fn checks_known_village_blacksmith_and_reports_its_parent() {
 }
 
 #[test]
+fn reports_and_filters_the_eye_located_stronghold_portal() {
+    let output = run(&["check", "0", "--stronghold-eyes", "2", "--format", "jsonl"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = &json_lines(&output)[0];
+    let condition = &report["filter"]["children"][0];
+    assert_eq!(condition["condition"], "stronghold_eyes");
+    assert_eq!(condition["observed_count"], 2);
+    assert_eq!(condition["hits"][0]["eye_count"], 2);
+    assert_eq!(condition["hits"][0]["eye_mask"], 0x030);
+    assert_eq!(condition["hits"][0]["position"]["x"], -196);
+    assert_eq!(condition["hits"][0]["position"]["z"], -1728);
+    assert_eq!(condition["hits"][0]["parent_position"]["x"], -204);
+    assert_eq!(condition["hits"][0]["parent_position"]["z"], -1692);
+
+    let no_match = run(&["check", "0", "--stronghold-eyes", "3"]);
+    assert_eq!(no_match.status.code(), Some(1));
+
+    let invalid = run(&["check", "0", "--stronghold-eyes", "13"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("不能超过 12"));
+
+    let reversed = run(&["check", "0", "--stronghold-eyes", "5..2"]);
+    assert_eq!(reversed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&reversed.stderr).contains("不能小于"));
+}
+
+#[test]
 fn rejects_a_piece_selector_not_owned_by_the_parent_structure() {
     let output = run(&["check", "0", "--piece-near", "shipwreck:blacksmith:1024"]);
     assert_eq!(output.status.code(), Some(2));
@@ -177,6 +208,42 @@ fn village_piece_search_is_reproducible_across_threads() {
     };
     assert_eq!(seeds(&single).len(), 3);
     assert_eq!(seeds(&single), seeds(&parallel));
+}
+
+#[test]
+fn stronghold_eye_search_is_reproducible_across_threads() {
+    let common = [
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "8",
+        "--count",
+        "3",
+        "--batch-size",
+        "2",
+        "--stronghold-eyes",
+        "0..12",
+        "--format",
+        "jsonl",
+    ];
+    let mut single_arguments = common.to_vec();
+    single_arguments.extend(["--threads", "1"]);
+    let mut parallel_arguments = common.to_vec();
+    parallel_arguments.extend(["--threads", "4"]);
+
+    let single = run(&single_arguments);
+    let parallel = run(&parallel_arguments);
+    assert!(single.status.success());
+    assert!(parallel.status.success());
+    let seeds = |output: &Output| -> Vec<i64> {
+        json_lines(output)
+            .iter()
+            .map(|value| value["seed"].as_i64().expect("seed"))
+            .collect()
+    };
+    assert_eq!(seeds(&single), vec![0, 1, 2]);
+    assert_eq!(seeds(&parallel), seeds(&single));
 }
 
 #[test]
