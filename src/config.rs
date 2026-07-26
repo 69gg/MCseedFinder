@@ -6,6 +6,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::accelerator::AcceleratorKind;
 use crate::domain::Dimension;
 use crate::native::{self, BiomeInfo, StructureInfo};
 
@@ -23,6 +24,8 @@ pub struct SearchFileConfig {
     pub results: Option<usize>,
     pub threads: Option<usize>,
     pub batch_size: Option<usize>,
+    pub accelerator: Option<AcceleratorKind>,
+    pub gpu_device: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -773,6 +776,7 @@ const fn default_min_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Anchor, CompiledCondition, CompiledFilter, FileConfig, conditions_from_flags};
+    use crate::accelerator::AcceleratorKind;
 
     #[test]
     fn rejects_unknown_json_fields() {
@@ -798,6 +802,19 @@ mod tests {
         let error =
             CompiledFilter::compile(file.conditions).expect_err("精确眼数和范围不能同时出现");
         assert!(error.to_string().contains("不能同时设置"));
+    }
+
+    #[test]
+    fn parses_gpu_search_settings_and_hip_alias() {
+        let rocm: FileConfig =
+            serde_json::from_str(r#"{"search":{"accelerator":"rocm","gpu_device":2}}"#)
+                .expect("ROCm 搜索配置应有效");
+        assert_eq!(rocm.search.accelerator, Some(AcceleratorKind::Rocm));
+        assert_eq!(rocm.search.gpu_device, Some(2));
+
+        let hip: FileConfig =
+            serde_json::from_str(r#"{"search":{"accelerator":"hip"}}"#).expect("HIP 别名应有效");
+        assert_eq!(hip.search.accelerator, Some(AcceleratorKind::Rocm));
     }
 
     #[test]

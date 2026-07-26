@@ -52,6 +52,8 @@ unsafe extern "C" {
     fn mcseed_context_destroy(context: *mut RawContext);
     fn mcseed_context_set_seed(context: *mut RawContext, seed: c_ulonglong);
     fn mcseed_spawn(context: *mut RawContext, spawn: *mut RawHit, biome_id: *mut c_int) -> c_int;
+    fn mcseed_estimated_spawn(context: *mut RawContext, spawn: *mut RawHit) -> c_int;
+    fn mcseed_spawn_refinement_radius(radius: *mut c_uint) -> c_int;
 
     fn mcseed_biome_count() -> c_int;
     fn mcseed_biome_name_at(index: c_int) -> *const c_char;
@@ -66,6 +68,7 @@ unsafe extern "C" {
     fn mcseed_structure_dimension_at(index: c_int) -> c_int;
     fn mcseed_structure_accuracy_at(index: c_int) -> c_int;
     fn mcseed_structure_id_from_name(name: *const c_char) -> c_int;
+    fn mcseed_structure_gpu_config(structure_id: c_int, config: *mut GpuStructureConfig) -> c_int;
 
     fn mcseed_piece_count() -> c_int;
     fn mcseed_piece_name_at(index: c_int) -> *const c_char;
@@ -125,6 +128,48 @@ unsafe extern "C" {
         anchor_z: c_int,
         hit: *mut RawPieceHit,
     ) -> c_int;
+
+    #[cfg(test)]
+    fn mcseed_gpu_reference_filter(
+        candidates: *const GpuCandidate,
+        candidate_count: usize,
+        configs: *const GpuStructureConfig,
+        config_count: usize,
+        predicates: *const GpuPredicate,
+        predicate_count: usize,
+        matches: *mut u8,
+    );
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GpuStructureConfig {
+    pub kind: i32,
+    pub salt: i32,
+    pub region_size: i32,
+    pub chunk_range: i32,
+    pub flags: i32,
+    pub reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GpuPredicate {
+    pub config_offset: u32,
+    pub config_count: u32,
+    pub radius: u32,
+    pub anchor_kind: i32,
+    pub anchor_x: i32,
+    pub anchor_z: i32,
+    pub minimum: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GpuCandidate {
+    pub seed: u64,
+    pub spawn_x: i32,
+    pub spawn_z: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +257,24 @@ pub struct PieceScanResult {
     pub hits: Vec<NativePieceHit>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeSpawn {
+    pub position: Position,
+    pub biome_id: i32,
+}
+
+impl NativeSpawn {
+    pub fn into_info(self) -> Result<SpawnInfo> {
+        let biome = biome_name(self.biome_id)
+            .ok_or_else(|| anyhow!("出生点返回了未知生物群系 ID {}", self.biome_id))?;
+        Ok(SpawnInfo {
+            position: self.position,
+            biome,
+            biome_id: self.biome_id,
+        })
+    }
+}
+
 pub struct NativeContext {
     raw: NonNull<RawContext>,
 }
@@ -227,21 +290,33 @@ impl NativeContext {
         unsafe { mcseed_context_set_seed(self.raw.as_ptr(), seed as u64) };
     }
 
-    pub fn spawn(&mut self) -> Result<SpawnInfo> {
+    pub(crate) fn spawn_raw(&mut self) -> Result<NativeSpawn> {
         let mut raw_hit = RawHit::default();
         let mut biome_id = -1;
         let status = unsafe { mcseed_spawn(self.raw.as_ptr(), &mut raw_hit, &mut biome_id) };
         ensure_status(status, "计算出生点")?;
-        let biome = biome_name(biome_id)
-            .ok_or_else(|| anyhow!("出生点返回了未知生物群系 ID {biome_id}"))?;
-        Ok(SpawnInfo {
+        Ok(NativeSpawn {
             position: Position {
                 x: raw_hit.x,
                 y: Some(raw_hit.y),
                 z: raw_hit.z,
             },
-            biome,
             biome_id,
+        })
+    }
+
+    pub fn spawn(&mut self) -> Result<SpawnInfo> {
+        self.spawn_raw()?.into_info()
+    }
+
+    pub(crate) fn estimated_spawn(&mut self) -> Result<Position> {
+        let mut raw_hit = RawHit::default();
+        let status = unsafe { mcseed_estimated_spawn(self.raw.as_ptr(), &mut raw_hit) };
+        ensure_status(status, "估算出生点")?;
+        Ok(Position {
+            x: raw_hit.x,
+            y: None,
+            z: raw_hit.z,
         })
     }
 
@@ -531,6 +606,50 @@ pub fn structure_by_name(name: &str) -> Result<StructureInfo> {
         .ok_or_else(|| anyhow!("结构注册表中缺少 ID {id}"))
 }
 
+pub(crate) fn gpu_structure_config(structure_id: i32) -> Result<Option<GpuStructureConfig>> {
+    let mut config = GpuStructureConfig::default();
+    match unsafe { mcseed_structure_gpu_config(structure_id, &mut config) } {
+        1 => {
+            if config.kind <= 0 || config.region_size <= 0 || config.chunk_range <= 0 {
+                bail!("结构 {structure_id} 返回了无效的 GPU 放置配置");
+            }
+            Ok(Some(config))
+        }
+        0 => Ok(None),
+        status => bail!("读取结构 {structure_id} 的 GPU 放置配置失败（错误码 {status}）"),
+    }
+}
+
+pub(crate) fn spawn_refinement_radius() -> Result<Option<u32>> {
+    let mut radius = 0;
+    match unsafe { mcseed_spawn_refinement_radius(&mut radius) } {
+        1 => Ok(Some(radius)),
+        0 => Ok(None),
+        status => bail!("读取出生点细化半径失败（错误码 {status}）"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_reference_filter(
+    candidates: &[GpuCandidate],
+    configs: &[GpuStructureConfig],
+    predicates: &[GpuPredicate],
+) -> Vec<u8> {
+    let mut matches = vec![0; candidates.len()];
+    unsafe {
+        mcseed_gpu_reference_filter(
+            candidates.as_ptr(),
+            candidates.len(),
+            configs.as_ptr(),
+            configs.len(),
+            predicates.as_ptr(),
+            predicates.len(),
+            matches.as_mut_ptr(),
+        )
+    };
+    matches
+}
+
 pub fn piece_selector(structure_id: i32, name: &str) -> Result<String> {
     let normalized = normalize_resource_name(name);
     let c_name = CString::new(normalized.as_str()).context("子结构名称包含 NUL 字符")?;
@@ -610,8 +729,9 @@ fn optional_c_string(pointer: *const c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeContext, PieceAccuracy, biome_by_name, biomes, piece_selector, pieces,
-        structure_by_name, structures,
+        GpuCandidate, GpuPredicate, GpuStructureConfig, NativeContext, PieceAccuracy,
+        biome_by_name, biomes, piece_selector, pieces, spawn_refinement_radius, structure_by_name,
+        structures,
     };
     use crate::domain::Dimension;
 
@@ -625,6 +745,34 @@ mod tests {
         assert_eq!(fossil.dimension, Dimension::Nether);
         assert_eq!(structures().expect("结构列表").len(), 22);
         assert!(biomes().expect("生物群系列表").len() > 50);
+    }
+
+    #[test]
+    fn gpu_ffi_layout_matches_the_native_abi() {
+        assert_eq!(std::mem::size_of::<GpuStructureConfig>(), 24);
+        assert_eq!(std::mem::size_of::<GpuPredicate>(), 32);
+        assert_eq!(std::mem::size_of::<GpuCandidate>(), 16);
+    }
+
+    #[test]
+    fn estimated_spawn_bound_contains_the_final_spawn() {
+        let radius = spawn_refinement_radius()
+            .expect("出生点细化能力")
+            .expect("当前版本应提供严格细化半径");
+        assert_eq!(radius, 125);
+        let radius_squared = u64::from(radius) * u64::from(radius);
+        let mut context = NativeContext::new().expect("生成器");
+        for seed in -16_i64..16 {
+            context.set_seed(seed);
+            let estimated = context.estimated_spawn().expect("估计出生点");
+            let final_spawn = context.spawn_raw().expect("最终出生点");
+            let dx = i64::from(final_spawn.position.x) - i64::from(estimated.x);
+            let dz = i64::from(final_spawn.position.z) - i64::from(estimated.z);
+            assert!(
+                (dx * dx + dz * dz) as u64 <= radius_squared,
+                "seed {seed} 的出生点细化超出严格边界"
+            );
+        }
     }
 
     #[test]

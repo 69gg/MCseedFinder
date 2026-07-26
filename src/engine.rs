@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
+use crate::accelerator::{AcceleratorInfo, AcceleratorKind, SearchAccelerator};
 use crate::config::{Anchor, CompiledCondition, CompiledFilter, MINECRAFT_VERSION};
 use crate::domain::{Dimension, Position, SpawnInfo, project_to_nether};
-use crate::native::{self, NativeContext, NativeHit, NativePieceHit};
+use crate::native::{self, GpuCandidate, NativeContext, NativeHit, NativePieceHit, NativeSpawn};
 
 pub const DEFAULT_START: i128 = 0;
 pub const DEFAULT_END: i128 = 1_000_000;
@@ -40,6 +41,8 @@ pub struct SearchSettings {
     pub results: usize,
     pub threads: usize,
     pub batch_size: usize,
+    pub accelerator: AcceleratorKind,
+    pub gpu_device: Option<u32>,
     pub progress: bool,
 }
 
@@ -75,6 +78,9 @@ impl SearchSettings {
         }
         if self.batch_size == 0 {
             bail!("批大小必须大于 0");
+        }
+        if self.accelerator == AcceleratorKind::Cpu && self.gpu_device.is_some() {
+            bail!("--gpu-device 不能与 --accelerator cpu 同时使用");
         }
         Ok(())
     }
@@ -167,6 +173,11 @@ pub struct SearchOutcome {
     pub mode: SearchMode,
     pub requested_results: usize,
     pub exhausted: bool,
+    pub accelerator: AcceleratorInfo,
+    pub gpu_candidates: u128,
+    pub gpu_survivors: u128,
+    pub gpu_coarse_candidates: u128,
+    pub gpu_coarse_survivors: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +185,63 @@ struct WorkItem {
     start: u128,
     end: u128,
     result_limit: usize,
+}
+
+struct PreparedCandidate {
+    index: u128,
+    seed: i64,
+    estimated_spawn: Option<Position>,
+    spawn: Option<NativeSpawn>,
+}
+
+impl PreparedCandidate {
+    fn gpu_candidate(&self, preparation: SpawnPreparation) -> Result<GpuCandidate> {
+        let position = match preparation {
+            SpawnPreparation::None => None,
+            SpawnPreparation::Estimate => Some(
+                self.estimated_spawn
+                    .ok_or_else(|| anyhow!("GPU 粗筛候选缺少估计出生点"))?,
+            ),
+            SpawnPreparation::Exact => Some(
+                self.spawn
+                    .ok_or_else(|| anyhow!("GPU 精筛候选缺少完整出生点"))?
+                    .position,
+            ),
+        };
+        let (spawn_x, spawn_z) = position
+            .map(|position| (position.x, position.z))
+            .unwrap_or((0, 0));
+        Ok(GpuCandidate {
+            seed: self.seed as u64,
+            spawn_x,
+            spawn_z,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SpawnPreparation {
+    None,
+    Estimate,
+    Exact,
+}
+
+enum WorkerCommand {
+    Search(WorkItem),
+    Prepare {
+        start: u128,
+        end: u128,
+        preparation: SpawnPreparation,
+    },
+    RefineSpawn {
+        candidates: Vec<PreparedCandidate>,
+        matches: Vec<u8>,
+    },
+    Evaluate {
+        candidates: Vec<PreparedCandidate>,
+        matches: Vec<u8>,
+        result_limit: usize,
+    },
 }
 
 struct IndexedReport {
@@ -188,6 +256,7 @@ struct WorkResult {
 
 enum WorkerReply {
     Ready(Result<()>),
+    Prepared(Result<Vec<PreparedCandidate>>),
     Complete(Result<WorkResult>),
 }
 
@@ -209,7 +278,11 @@ pub fn evaluate_seed(seed: i64, filter: &CompiledFilter) -> Result<SeedReport> {
     evaluation.report(seed, filter)
 }
 
-pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<SearchOutcome> {
+pub fn search(
+    filter: Arc<CompiledFilter>,
+    settings: &SearchSettings,
+    mut accelerator: SearchAccelerator,
+) -> Result<SearchOutcome> {
     settings.validate()?;
     let started = Instant::now();
     let candidate_count = settings.mode.candidate_count();
@@ -224,7 +297,7 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker in 0..worker_count {
-            let (task_sender, task_receiver) = mpsc::channel::<WorkItem>();
+            let (task_sender, task_receiver) = mpsc::channel::<WorkerCommand>();
             let (reply_sender, reply_receiver) = mpsc::channel::<WorkerReply>();
             let filter = Arc::clone(&filter);
             let mode = settings.mode;
@@ -241,9 +314,43 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
                     if reply_sender.send(WorkerReply::Ready(Ok(()))).is_err() {
                         return;
                     }
-                    while let Ok(work) = task_receiver.recv() {
-                        let result = search_index_range(work, mode, &filter, &mut native);
-                        if reply_sender.send(WorkerReply::Complete(result)).is_err() {
+                    while let Ok(command) = task_receiver.recv() {
+                        let reply = match command {
+                            WorkerCommand::Search(work) => WorkerReply::Complete(
+                                search_index_range(work, mode, &filter, &mut native),
+                            ),
+                            WorkerCommand::Prepare {
+                                start,
+                                end,
+                                preparation,
+                            } => WorkerReply::Prepared(prepare_index_range(
+                                start,
+                                end,
+                                mode,
+                                preparation,
+                                &mut native,
+                            )),
+                            WorkerCommand::RefineSpawn {
+                                candidates,
+                                matches,
+                            } => WorkerReply::Prepared(refine_prepared_spawns(
+                                candidates,
+                                matches,
+                                &mut native,
+                            )),
+                            WorkerCommand::Evaluate {
+                                candidates,
+                                matches,
+                                result_limit,
+                            } => WorkerReply::Complete(evaluate_prepared_range(
+                                candidates,
+                                matches,
+                                result_limit,
+                                &filter,
+                                &mut native,
+                            )),
+                        };
+                        if reply_sender.send(reply).is_err() {
                             break;
                         }
                     }
@@ -258,13 +365,19 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
             for receiver in &reply_receivers {
                 match receiver.recv().context("搜索工作线程在初始化时断开")? {
                     WorkerReply::Ready(result) => result?,
-                    WorkerReply::Complete(_) => bail!("搜索工作线程返回了无效的初始化消息"),
+                    WorkerReply::Prepared(_) | WorkerReply::Complete(_) => {
+                        bail!("搜索工作线程返回了无效的初始化消息")
+                    }
                 }
             }
 
             let mut cursor = 0_u128;
             let mut checked = 0_u128;
             let mut reports = Vec::new();
+            let mut gpu_candidates_checked = 0_u128;
+            let mut gpu_survivors = 0_u128;
+            let mut gpu_coarse_candidates = 0_u128;
+            let mut gpu_coarse_survivors = 0_u128;
 
             while cursor < candidate_count && reports.len() < settings.results {
                 let batch_end = min(
@@ -275,16 +388,182 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
                 let active_workers = min(worker_count, batch_length as usize);
                 let remaining = settings.results - reports.len();
 
-                for (worker, sender) in task_senders.iter().take(active_workers).enumerate() {
-                    let start = cursor + batch_length * worker as u128 / active_workers as u128;
-                    let end = cursor + batch_length * (worker + 1) as u128 / active_workers as u128;
-                    sender
-                        .send(WorkItem {
-                            start,
-                            end,
-                            result_limit: remaining,
-                        })
-                        .with_context(|| format!("无法向搜索工作线程 {} 派发任务", worker + 1))?;
+                if accelerator.is_gpu() {
+                    let needs_spawn = accelerator.needs_spawn();
+                    let coarse_stage = accelerator.has_coarse_stage();
+                    let preparation = if coarse_stage {
+                        SpawnPreparation::Estimate
+                    } else if needs_spawn {
+                        SpawnPreparation::Exact
+                    } else {
+                        SpawnPreparation::None
+                    };
+                    for (worker, sender) in task_senders.iter().take(active_workers).enumerate() {
+                        let start = cursor + batch_length * worker as u128 / active_workers as u128;
+                        let end =
+                            cursor + batch_length * (worker + 1) as u128 / active_workers as u128;
+                        sender
+                            .send(WorkerCommand::Prepare {
+                                start,
+                                end,
+                                preparation,
+                            })
+                            .with_context(|| {
+                                format!("无法向搜索工作线程 {} 派发 GPU 准备任务", worker + 1)
+                            })?;
+                    }
+
+                    let mut prepared_chunks = Vec::with_capacity(active_workers);
+                    for (worker, receiver) in
+                        reply_receivers.iter().take(active_workers).enumerate()
+                    {
+                        let prepared = match receiver.recv().with_context(|| {
+                            format!("搜索工作线程 {} 在准备 GPU 批次时意外断开", worker + 1)
+                        })? {
+                            WorkerReply::Prepared(result) => result?,
+                            WorkerReply::Ready(_) | WorkerReply::Complete(_) => {
+                                bail!("搜索工作线程返回了无效的 GPU 准备消息")
+                            }
+                        };
+                        prepared_chunks.push(prepared);
+                    }
+
+                    let coarse_matches = if coarse_stage {
+                        let coarse_candidates = prepared_chunks
+                            .iter()
+                            .flatten()
+                            .map(|candidate| candidate.gpu_candidate(SpawnPreparation::Estimate))
+                            .collect::<Result<Vec<_>>>()?;
+                        let coarse_matches = accelerator.filter_coarse(&coarse_candidates)?;
+                        if coarse_matches.len() != coarse_candidates.len() {
+                            bail!("GPU 粗筛结果数量与候选种子数量不一致");
+                        }
+                        gpu_coarse_candidates = gpu_coarse_candidates
+                            .checked_add(coarse_matches.len() as u128)
+                            .ok_or_else(|| anyhow!("GPU 粗筛候选数溢出"))?;
+                        gpu_coarse_survivors = gpu_coarse_survivors
+                            .checked_add(
+                                coarse_matches.iter().map(|value| u128::from(*value)).sum(),
+                            )
+                            .ok_or_else(|| anyhow!("GPU 粗筛保留候选数溢出"))?;
+
+                        let mut match_offset = 0;
+                        for (worker, (sender, candidates)) in task_senders
+                            .iter()
+                            .zip(prepared_chunks)
+                            .take(active_workers)
+                            .enumerate()
+                        {
+                            let match_end = match_offset + candidates.len();
+                            sender
+                                .send(WorkerCommand::RefineSpawn {
+                                    candidates,
+                                    matches: coarse_matches[match_offset..match_end].to_vec(),
+                                })
+                                .with_context(|| {
+                                    format!("无法向搜索工作线程 {} 派发出生点细化任务", worker + 1)
+                                })?;
+                            match_offset = match_end;
+                        }
+
+                        prepared_chunks = Vec::with_capacity(active_workers);
+                        for (worker, receiver) in
+                            reply_receivers.iter().take(active_workers).enumerate()
+                        {
+                            let prepared = match receiver.recv().with_context(|| {
+                                format!("搜索工作线程 {} 在细化出生点时意外断开", worker + 1)
+                            })? {
+                                WorkerReply::Prepared(result) => result?,
+                                WorkerReply::Ready(_) | WorkerReply::Complete(_) => {
+                                    bail!("搜索工作线程返回了无效的出生点细化消息")
+                                }
+                            };
+                            prepared_chunks.push(prepared);
+                        }
+                        Some(coarse_matches)
+                    } else {
+                        None
+                    };
+
+                    let batch_candidate_count = prepared_chunks.iter().map(Vec::len).sum::<usize>();
+                    let matches = if let Some(coarse_matches) = &coarse_matches {
+                        let survivor_count = coarse_matches
+                            .iter()
+                            .filter(|placement_match| **placement_match == 1)
+                            .count();
+                        let mut survivor_indexes = Vec::with_capacity(survivor_count);
+                        let mut exact_candidates = Vec::with_capacity(survivor_count);
+                        for (index, candidate) in prepared_chunks.iter().flatten().enumerate() {
+                            if coarse_matches[index] == 1 {
+                                survivor_indexes.push(index);
+                                exact_candidates
+                                    .push(candidate.gpu_candidate(SpawnPreparation::Exact)?);
+                            }
+                        }
+                        let exact_matches = accelerator.filter(&exact_candidates)?;
+                        if exact_matches.len() != exact_candidates.len() {
+                            bail!("GPU 精筛结果数量与粗筛幸存者数量不一致");
+                        }
+                        let mut matches = vec![0; batch_candidate_count];
+                        for (index, placement_match) in
+                            survivor_indexes.into_iter().zip(exact_matches)
+                        {
+                            matches[index] = placement_match;
+                        }
+                        matches
+                    } else {
+                        let gpu_candidates = prepared_chunks
+                            .iter()
+                            .flatten()
+                            .map(|candidate| candidate.gpu_candidate(preparation))
+                            .collect::<Result<Vec<_>>>()?;
+                        let matches = accelerator.filter(&gpu_candidates)?;
+                        if matches.len() != gpu_candidates.len() {
+                            bail!("GPU 预筛选结果数量与候选种子数量不一致");
+                        }
+                        matches
+                    };
+                    gpu_candidates_checked = gpu_candidates_checked
+                        .checked_add(batch_candidate_count as u128)
+                        .ok_or_else(|| anyhow!("GPU 已检查候选数溢出"))?;
+                    gpu_survivors = gpu_survivors
+                        .checked_add(matches.iter().map(|value| u128::from(*value)).sum())
+                        .ok_or_else(|| anyhow!("GPU 保留候选数溢出"))?;
+
+                    let mut match_offset = 0;
+                    for (worker, (sender, candidates)) in task_senders
+                        .iter()
+                        .zip(prepared_chunks)
+                        .take(active_workers)
+                        .enumerate()
+                    {
+                        let match_end = match_offset + candidates.len();
+                        sender
+                            .send(WorkerCommand::Evaluate {
+                                candidates,
+                                matches: matches[match_offset..match_end].to_vec(),
+                                result_limit: remaining,
+                            })
+                            .with_context(|| {
+                                format!("无法向搜索工作线程 {} 派发精确复核任务", worker + 1)
+                            })?;
+                        match_offset = match_end;
+                    }
+                } else {
+                    for (worker, sender) in task_senders.iter().take(active_workers).enumerate() {
+                        let start = cursor + batch_length * worker as u128 / active_workers as u128;
+                        let end =
+                            cursor + batch_length * (worker + 1) as u128 / active_workers as u128;
+                        sender
+                            .send(WorkerCommand::Search(WorkItem {
+                                start,
+                                end,
+                                result_limit: remaining,
+                            }))
+                            .with_context(|| {
+                                format!("无法向搜索工作线程 {} 派发任务", worker + 1)
+                            })?;
+                    }
                 }
 
                 let mut batch_reports = Vec::new();
@@ -294,7 +573,9 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
                         .with_context(|| format!("搜索工作线程 {} 意外断开", worker + 1))?
                     {
                         WorkerReply::Complete(result) => result?,
-                        WorkerReply::Ready(_) => bail!("搜索工作线程重复发送初始化消息"),
+                        WorkerReply::Ready(_) | WorkerReply::Prepared(_) => {
+                            bail!("搜索工作线程返回了无效的完成消息")
+                        }
                     };
                     checked = checked
                         .checked_add(result.checked)
@@ -313,10 +594,24 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
 
                 if settings.progress {
                     let rate = checked as f64 / started.elapsed().as_secs_f64().max(0.001);
-                    eprintln!(
-                        "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s",
-                        reports.len()
-                    );
+                    if accelerator.is_gpu() {
+                        if gpu_coarse_candidates > 0 {
+                            eprintln!(
+                                "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 粗筛 {gpu_coarse_survivors}/{gpu_coarse_candidates}，最终保留 {gpu_survivors}/{gpu_candidates_checked}",
+                                reports.len()
+                            );
+                        } else {
+                            eprintln!(
+                                "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 保留 {gpu_survivors}/{gpu_candidates_checked}",
+                                reports.len()
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s",
+                            reports.len()
+                        );
+                    }
                 }
             }
 
@@ -327,6 +622,11 @@ pub fn search(filter: Arc<CompiledFilter>, settings: &SearchSettings) -> Result<
                 elapsed: started.elapsed(),
                 mode: settings.mode,
                 requested_results: settings.results,
+                accelerator: accelerator.info().clone(),
+                gpu_candidates: gpu_candidates_checked,
+                gpu_survivors,
+                gpu_coarse_candidates,
+                gpu_coarse_survivors,
             })
         })();
 
@@ -369,11 +669,105 @@ fn search_index_range(
     Ok(WorkResult { reports, checked })
 }
 
+fn prepare_index_range(
+    start: u128,
+    end: u128,
+    mode: SearchMode,
+    preparation: SpawnPreparation,
+    native: &mut NativeContext,
+) -> Result<Vec<PreparedCandidate>> {
+    let capacity = usize::try_from(end - start).context("GPU 准备批次长度超出 usize")?;
+    let mut candidates = Vec::with_capacity(capacity);
+    for index in start..end {
+        let seed = mode.seed_at(index)?;
+        let (estimated_spawn, spawn) = match preparation {
+            SpawnPreparation::None => (None, None),
+            SpawnPreparation::Estimate => {
+                native.set_seed(seed);
+                (Some(native.estimated_spawn()?), None)
+            }
+            SpawnPreparation::Exact => {
+                native.set_seed(seed);
+                (None, Some(native.spawn_raw()?))
+            }
+        };
+        candidates.push(PreparedCandidate {
+            index,
+            seed,
+            estimated_spawn,
+            spawn,
+        });
+    }
+    Ok(candidates)
+}
+
+fn refine_prepared_spawns(
+    mut candidates: Vec<PreparedCandidate>,
+    matches: Vec<u8>,
+    native: &mut NativeContext,
+) -> Result<Vec<PreparedCandidate>> {
+    if candidates.len() != matches.len() {
+        bail!("GPU 粗筛批次的候选数与掩码长度不一致");
+    }
+    for (candidate, placement_match) in candidates.iter_mut().zip(matches) {
+        match placement_match {
+            0 => {}
+            1 => {
+                native.set_seed(candidate.seed);
+                candidate.spawn = Some(native.spawn_raw()?);
+            }
+            value => bail!("GPU 粗筛返回了无效布尔值 {value}"),
+        }
+    }
+    Ok(candidates)
+}
+
+fn evaluate_prepared_range(
+    candidates: Vec<PreparedCandidate>,
+    matches: Vec<u8>,
+    result_limit: usize,
+    filter: &CompiledFilter,
+    native: &mut NativeContext,
+) -> Result<WorkResult> {
+    if candidates.len() != matches.len() {
+        bail!("GPU 精确复核批次的候选数与掩码长度不一致");
+    }
+    let mut reports = Vec::new();
+    let mut checked = 0_u128;
+    for (candidate, placement_match) in candidates.into_iter().zip(matches) {
+        checked += 1;
+        if placement_match == 0 {
+            continue;
+        }
+        if placement_match != 1 {
+            bail!("GPU 预筛选返回了无效布尔值 {placement_match}");
+        }
+        native.set_seed(candidate.seed);
+        let spawn = candidate.spawn.map(NativeSpawn::into_info).transpose()?;
+        let mut evaluation = Evaluation::with_spawn(native, spawn);
+        let matched = evaluation.evaluate(&filter.root, false)?.matched;
+        if matched {
+            reports.push(IndexedReport {
+                index: candidate.index,
+                report: evaluation.report(candidate.seed, filter)?,
+            });
+            if reports.len() >= result_limit {
+                break;
+            }
+        }
+    }
+    Ok(WorkResult { reports, checked })
+}
+
 impl<'a> Evaluation<'a> {
     fn new(native: &'a mut NativeContext) -> Self {
+        Self::with_spawn(native, None)
+    }
+
+    fn with_spawn(native: &'a mut NativeContext, spawn: Option<SpawnInfo>) -> Self {
         Self {
             native,
-            spawn: None,
+            spawn,
             stronghold_portals: Vec::new(),
         }
     }
@@ -783,7 +1177,48 @@ pub fn default_thread_count() -> usize {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{FULL_SEED_SPACE, SearchMode, SearchSettings, count_matches, scan_limit};
+    use super::{
+        AcceleratorKind, FULL_SEED_SPACE, PreparedCandidate, SearchMode, SearchSettings,
+        SpawnPreparation, count_matches, scan_limit,
+    };
+    use crate::domain::Position;
+    use crate::native::NativeSpawn;
+
+    #[test]
+    fn gpu_candidates_require_the_requested_spawn_precision() {
+        let mut candidate = PreparedCandidate {
+            index: 0,
+            seed: -1,
+            estimated_spawn: Some(Position {
+                x: 24,
+                y: None,
+                z: -40,
+            }),
+            spawn: None,
+        };
+        let estimated = candidate
+            .gpu_candidate(SpawnPreparation::Estimate)
+            .expect("估计出生点应可用于粗筛");
+        assert_eq!((estimated.spawn_x, estimated.spawn_z), (24, -40));
+        assert!(candidate.gpu_candidate(SpawnPreparation::Exact).is_err());
+
+        candidate.spawn = Some(NativeSpawn {
+            position: Position {
+                x: 16,
+                y: Some(70),
+                z: -32,
+            },
+            biome_id: 1,
+        });
+        let exact = candidate
+            .gpu_candidate(SpawnPreparation::Exact)
+            .expect("完整出生点应可用于精筛");
+        assert_eq!((exact.spawn_x, exact.spawn_z), (16, -32));
+        let fixed = candidate
+            .gpu_candidate(SpawnPreparation::None)
+            .expect("固定锚点不需要出生点");
+        assert_eq!((fixed.spawn_x, fixed.spawn_z), (0, 0));
+    }
 
     #[test]
     fn count_bounds_support_absence_filters() {
@@ -803,6 +1238,8 @@ mod tests {
             results: 1,
             threads: 1,
             batch_size: 1,
+            accelerator: AcceleratorKind::Cpu,
+            gpu_device: None,
             progress: false,
         };
         settings.validate().expect("范围应有效");
@@ -818,6 +1255,8 @@ mod tests {
             results: 1,
             threads: 1,
             batch_size: 1,
+            accelerator: AcceleratorKind::Cpu,
+            gpu_device: None,
             progress: false,
         };
         settings.validate().expect("完整 64 位随机空间应有效");

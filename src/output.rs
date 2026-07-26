@@ -2,10 +2,12 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 
+use crate::accelerator::AcceleratorInfo;
 use crate::cli::OutputFormat;
 use crate::engine::{ConditionReport, SearchMode, SearchOutcome, SearchSettings, SeedReport};
 
-pub fn write_search_start(settings: &SearchSettings) {
+pub fn write_search_start(settings: &SearchSettings, accelerator: &AcceleratorInfo) {
+    eprintln!("搜索后端：{}", accelerator.description());
     if let SearchMode::Random {
         random_seed,
         max_attempts,
@@ -40,6 +42,23 @@ pub fn write_search_summary(outcome: &SearchOutcome) {
         seconds,
         rate
     );
+    if outcome.gpu_candidates > 0 {
+        let retained = outcome.gpu_survivors as f64 * 100.0 / outcome.gpu_candidates as f64;
+        if outcome.gpu_coarse_candidates > 0 {
+            let coarse_retained =
+                outcome.gpu_coarse_survivors as f64 * 100.0 / outcome.gpu_coarse_candidates as f64;
+            eprintln!(
+                "GPU 出生点粗筛：保留 {}/{}（{coarse_retained:.3}%）",
+                outcome.gpu_coarse_survivors, outcome.gpu_coarse_candidates
+            );
+        }
+        eprintln!(
+            "GPU 预筛选：{}，保留 {}/{}（{retained:.3}%）",
+            outcome.accelerator.description(),
+            outcome.gpu_survivors,
+            outcome.gpu_candidates
+        );
+    }
     if outcome.exhausted {
         eprintln!(
             "搜索空间或最大尝试次数已耗尽：目标 {} 个，实际找到 {} 个",

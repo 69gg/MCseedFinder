@@ -292,6 +292,10 @@ struct McSeedContext {
 static const size_t STRUCTURE_COUNT = sizeof(STRUCTURES) / sizeof(STRUCTURES[0]);
 static const size_t STATIC_PIECE_COUNT = sizeof(STATIC_PIECES) / sizeof(STATIC_PIECES[0]);
 
+static const StructureConfig NETHER_FOSSIL_CONFIG = {
+    14357921, 2, 1, 0, DIM_NETHER, 0.0f
+};
+
 static int64_t floor_div_i64(int64_t value, int64_t divisor)
 {
     int64_t quotient = value / divisor;
@@ -498,6 +502,46 @@ int32_t mcseed_spawn(McSeedContext *context, McSeedHit *spawn, int32_t *biome_id
     return 0;
 }
 
+int32_t mcseed_estimated_spawn(McSeedContext *context, McSeedHit *spawn)
+{
+    Generator *generator;
+    Pos position;
+    if (!context || !spawn)
+        return -1;
+    generator = generator_for_dimension(context, DIM_OVERWORLD);
+    if (!generator)
+        return -2;
+    position = estimateSpawn(generator, NULL);
+    spawn->x = position.x;
+    spawn->y = INT32_MIN;
+    spawn->z = position.z;
+    spawn->id = 0;
+    return 0;
+}
+
+int32_t mcseed_spawn_refinement_radius(uint32_t *radius)
+{
+    uint32_t axis_bound;
+    uint32_t squared_bound;
+    uint32_t horizontal_bound = 0;
+    if (!radius)
+        return -1;
+    if (MCSEED_CUBIOMES_VERSION < MC_1_18)
+        return 0;
+
+    /*
+     * Modern getSpawn scans offsets j,k in [-5,5]. Relative to the estimated
+     * chunk centre, a sampled block coordinate is j*16 - 8 + {0,4,8,12}, so
+     * the maximum absolute offset on either axis is 5*16+8 = 88 blocks.
+     */
+    axis_bound = 5 * 16 + 8;
+    squared_bound = 2 * axis_bound * axis_bound;
+    while (horizontal_bound * horizontal_bound < squared_bound)
+        horizontal_bound++;
+    *radius = horizontal_bound;
+    return 1;
+}
+
 int32_t mcseed_biome_count(void)
 {
     int32_t id;
@@ -627,6 +671,83 @@ int32_t mcseed_structure_id_from_name(const char *name)
     if (name_is(name, "ruined_portal_n"))
         return 22;
     return -1;
+}
+
+int32_t mcseed_structure_gpu_config(
+    int32_t structure_id,
+    McSeedGpuStructureConfig *output
+)
+{
+    const McSeedStructureInfo *info = structure_by_id(structure_id);
+    StructureConfig config;
+    int32_t kind;
+    int32_t flags = 0;
+    if (!info || !output)
+        return -1;
+    memset(output, 0, sizeof(*output));
+
+    if (info->cubiomes_type == MCSEED_STRUCTURE_NETHER_FOSSIL) {
+        config = NETHER_FOSSIL_CONFIG;
+        kind = MCSEED_GPU_PLACEMENT_FEATURE;
+    } else {
+        if (!getStructureConfig(
+                info->cubiomes_type,
+                MCSEED_CUBIOMES_VERSION,
+                &config
+            ))
+            return 0;
+        switch (info->cubiomes_type) {
+        case Monument:
+        case Mansion:
+            kind = MCSEED_GPU_PLACEMENT_LARGE;
+            break;
+        case End_City:
+            kind = MCSEED_GPU_PLACEMENT_LARGE;
+            flags |= MCSEED_GPU_PLACEMENT_END_DISTANCE;
+            break;
+        case Outpost:
+            kind = MCSEED_GPU_PLACEMENT_OUTPOST;
+            break;
+        case Treasure:
+            kind = MCSEED_GPU_PLACEMENT_TREASURE;
+            break;
+        case Fortress:
+            if (MCSEED_CUBIOMES_VERSION < MC_1_18)
+                return 0;
+            kind = MCSEED_GPU_PLACEMENT_FORTRESS;
+            break;
+        case Bastion:
+            if (MCSEED_CUBIOMES_VERSION < MC_1_18)
+                return 0;
+            kind = MCSEED_GPU_PLACEMENT_BASTION;
+            break;
+        case Desert_Pyramid:
+        case Jungle_Pyramid:
+        case Swamp_Hut:
+        case Igloo:
+        case Village:
+        case Ocean_Ruin:
+        case Shipwreck:
+        case Ruined_Portal:
+        case Ruined_Portal_N:
+        case Ancient_City:
+        case Trail_Ruins:
+        case Trial_Chambers:
+            kind = MCSEED_GPU_PLACEMENT_FEATURE;
+            break;
+        case Mineshaft:
+        case Stronghold:
+        default:
+            return 0;
+        }
+    }
+
+    output->kind = kind;
+    output->salt = config.salt;
+    output->region_size = config.regionSize;
+    output->chunk_range = config.chunkRange;
+    output->flags = flags;
+    return 1;
 }
 
 static const McJigsawElementData *village_element_for_list_index(int32_t requested)
@@ -892,9 +1013,7 @@ static int32_t find_nether_fossils(
     int32_t *limit_reached
 )
 {
-    const StructureConfig config = {
-        14357921, 2, 1, 0, DIM_NETHER, 0.0f
-    };
+    const StructureConfig config = NETHER_FOSSIL_CONFIG;
     Generator *generator = generator_for_dimension(context, DIM_NETHER);
     int64_t region_span = (int64_t)config.regionSize * 16;
     int64_t rx_min = floor_div_i64((int64_t)anchor_x - radius, region_span) - 1;

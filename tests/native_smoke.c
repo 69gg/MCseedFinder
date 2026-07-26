@@ -1,5 +1,6 @@
 #include "bridge.h"
 #include "finders.h"
+#include "gpu/placement.h"
 #include "jigsaw.h"
 #include "version.h"
 
@@ -15,6 +16,128 @@ static int32_t flat_surface_height(void *context, int32_t x, int32_t z)
     (void)x;
     (void)z;
     return 64;
+}
+
+typedef struct PlacementCase {
+    const char *name;
+    int32_t cubiomes_type;
+} PlacementCase;
+
+enum {
+    MCSEED_TEST_CUSTOM_PLACEMENT = -1,
+};
+
+static void assert_gpu_placements_match_cubiomes(void)
+{
+    static const PlacementCase CASES[] = {
+        {"pillager_outpost", Outpost},
+        {"mansion", Mansion},
+        {"jungle_pyramid", Jungle_Pyramid},
+        {"desert_pyramid", Desert_Pyramid},
+        {"igloo", Igloo},
+        {"shipwreck", Shipwreck},
+        {"swamp_hut", Swamp_Hut},
+        {"monument", Monument},
+        {"ocean_ruin", Ocean_Ruin},
+        {"fortress", Fortress},
+        {"nether_fossil", MCSEED_TEST_CUSTOM_PLACEMENT},
+        {"end_city", End_City},
+        {"buried_treasure", Treasure},
+        {"bastion_remnant", Bastion},
+        {"village", Village},
+        {"ruined_portal", Ruined_Portal},
+        {"ancient_city", Ancient_City},
+        {"trail_ruins", Trail_Ruins},
+        {"trial_chambers", Trial_Chambers},
+        {"ruined_portal_nether", Ruined_Portal_N},
+    };
+    static const uint64_t SEEDS[] = {
+        UINT64_C(0),
+        UINT64_MAX,
+        UINT64_C(1),
+        UINT64_C(0x8000000000000000),
+        UINT64_C(0x0123456789abcdef),
+        UINT64_C(0xfedcba9876543210),
+        UINT64_C(0x9e3779b97f4a7c15),
+        UINT64_C(0x5deece66d),
+    };
+    size_t case_index;
+    size_t accelerated_count = 0;
+    int32_t registry_index;
+    for (registry_index = 0; registry_index < mcseed_structure_count(); registry_index++) {
+        McSeedGpuStructureConfig config;
+        int32_t structure_id = mcseed_structure_id_at(registry_index);
+        assert(structure_id >= 0);
+        if (mcseed_structure_gpu_config(structure_id, &config) == 1)
+            accelerated_count++;
+    }
+    assert(sizeof(CASES) / sizeof(CASES[0]) == accelerated_count);
+
+    for (case_index = 0; case_index < sizeof(CASES) / sizeof(CASES[0]); case_index++) {
+        const PlacementCase *placement_case = &CASES[case_index];
+        McSeedGpuStructureConfig gpu_config;
+        StructureConfig feature_config = {0};
+        int32_t structure_id = mcseed_structure_id_from_name(placement_case->name);
+        int saw_valid = 0;
+        int saw_invalid = 0;
+        size_t seed_index;
+        assert(structure_id >= 0);
+        assert(mcseed_structure_gpu_config(structure_id, &gpu_config) == 1);
+        feature_config.salt = gpu_config.salt;
+        feature_config.regionSize = (int8_t)gpu_config.region_size;
+        feature_config.chunkRange = (int8_t)gpu_config.chunk_range;
+
+        for (seed_index = 0; seed_index < sizeof(SEEDS) / sizeof(SEEDS[0]); seed_index++) {
+            int32_t region_z;
+            for (region_z = -8; region_z <= 8; region_z++) {
+                int32_t region_x;
+                for (region_x = -8; region_x <= 8; region_x++) {
+                    McSeedGpuPosition gpu_position;
+                    Pos cubiomes_position;
+                    int gpu_valid = mcseed_gpu_position_for_region(
+                        &gpu_config,
+                        SEEDS[seed_index],
+                        region_x,
+                        region_z,
+                        &gpu_position
+                    );
+                    int cubiomes_valid;
+                    if (placement_case->cubiomes_type == MCSEED_TEST_CUSTOM_PLACEMENT) {
+                        cubiomes_position = getFeaturePos(
+                            feature_config,
+                            SEEDS[seed_index],
+                            region_x,
+                            region_z
+                        );
+                        cubiomes_valid = 1;
+                    } else {
+                        cubiomes_valid = getStructurePos(
+                            placement_case->cubiomes_type,
+                            MCSEED_CUBIOMES_VERSION,
+                            SEEDS[seed_index],
+                            region_x,
+                            region_z,
+                            &cubiomes_position
+                        );
+                    }
+                    assert(gpu_valid == cubiomes_valid);
+                    if (gpu_valid) {
+                        saw_valid = 1;
+                        assert(gpu_position.x == cubiomes_position.x);
+                        assert(gpu_position.z == cubiomes_position.z);
+                    } else {
+                        saw_invalid = 1;
+                    }
+                }
+            }
+        }
+        assert(saw_valid);
+        if (gpu_config.kind == MCSEED_GPU_PLACEMENT_OUTPOST ||
+            gpu_config.kind == MCSEED_GPU_PLACEMENT_TREASURE ||
+            gpu_config.kind == MCSEED_GPU_PLACEMENT_BASTION ||
+            (gpu_config.flags & MCSEED_GPU_PLACEMENT_END_DISTANCE) != 0)
+            assert(saw_invalid);
+    }
 }
 
 static void assert_village_centers_match_cubiomes_variant(void)
@@ -90,7 +213,9 @@ int main(void)
     int32_t fossil_id;
     int32_t limit_reached;
     uint64_t found;
+    uint32_t spawn_refinement_radius;
 
+    assert_gpu_placements_match_cubiomes();
     assert_village_centers_match_cubiomes_variant();
     assert(mcseed_biome_count() > 50);
     assert(mcseed_structure_count() == 22);
@@ -115,9 +240,34 @@ int main(void)
     assert(context != NULL);
     mcseed_context_set_seed(context, 0);
 
-    assert(mcseed_spawn(context, &spawn, &biome_id) == 0);
+    {
+        McSeedHit estimated;
+        int64_t dx;
+        int64_t dz;
+        assert(mcseed_estimated_spawn(context, &estimated) == 0);
+        assert(mcseed_spawn_refinement_radius(&spawn_refinement_radius) == 1);
+        assert(spawn_refinement_radius == 125);
+        assert(mcseed_spawn(context, &spawn, &biome_id) == 0);
+        dx = (int64_t)spawn.x - estimated.x;
+        dz = (int64_t)spawn.z - estimated.z;
+        assert(dx * dx + dz * dz <=
+            (int64_t)spawn_refinement_radius * spawn_refinement_radius);
+    }
+
     assert(spawn.x == -32 && spawn.y == 65 && spawn.z == 0);
     assert(biome_id == forest_id);
+
+    {
+        McSeedGpuStructureConfig config;
+        McSeedGpuPredicate predicate = {0, 1, 1024, MCSEED_GPU_ANCHOR_SPAWN, 0, 0, 1};
+        McSeedGpuCandidate candidate = {0, spawn.x, spawn.z};
+        uint8_t placement_match = 0;
+        assert(mcseed_structure_gpu_config(village_id, &config) == 1);
+        mcseed_gpu_reference_filter(
+            &candidate, 1, &config, 1, &predicate, 1, &placement_match
+        );
+        assert(placement_match == 1);
+    }
 
     assert(mcseed_find_biomes(
         context, 0, &forest_id, 1, spawn.x, spawn.z, 64, 64, 64,

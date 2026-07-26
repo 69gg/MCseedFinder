@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gpu/abi.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,6 +39,11 @@ int32_t mcseed_spawn(
     int32_t *biome_id
 );
 
+/** Fast spawn estimate used by the conservative two-stage GPU prefilter. */
+int32_t mcseed_estimated_spawn(McSeedContext *context, McSeedHit *spawn);
+/** Return 1 and the strict estimate-to-final horizontal bound when available. */
+int32_t mcseed_spawn_refinement_radius(uint32_t *radius);
+
 int32_t mcseed_biome_count(void);
 const char *mcseed_biome_name_at(int32_t index);
 int32_t mcseed_biome_id_at(int32_t index);
@@ -50,6 +57,11 @@ int32_t mcseed_structure_id_at(int32_t index);
 int32_t mcseed_structure_dimension_at(int32_t index);
 int32_t mcseed_structure_accuracy_at(int32_t index);
 int32_t mcseed_structure_id_from_name(const char *name);
+/** Return 1 when the structure has a conservative GPU placement prefilter. */
+int32_t mcseed_structure_gpu_config(
+    int32_t structure_id,
+    McSeedGpuStructureConfig *config
+);
 
 int32_t mcseed_piece_count(void);
 const char *mcseed_piece_name_at(int32_t index);

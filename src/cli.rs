@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::accelerator::AcceleratorKind;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "mcseed-finder",
@@ -60,6 +62,14 @@ pub struct FindArgs {
     /// 每批按当前遍历顺序派发的种子数量
     #[arg(long)]
     pub batch_size: Option<usize>,
+
+    /// 搜索后端：auto、cpu、cuda 或 rocm（hip 是 rocm 的别名）
+    #[arg(long, value_enum)]
+    pub accelerator: Option<AcceleratorKind>,
+
+    /// CUDA/ROCm 设备索引；默认使用设备 0
+    #[arg(long, value_name = "INDEX")]
+    pub gpu_device: Option<u32>,
 
     /// 输出格式
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -136,4 +146,22 @@ pub enum ListKind {
 pub enum OutputFormat {
     Text,
     Jsonl,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+    use crate::accelerator::AcceleratorKind;
+
+    #[test]
+    fn hip_cli_alias_selects_the_rocm_backend() {
+        let cli = Cli::try_parse_from(["mcseed-finder", "find", "--accelerator", "hip"])
+            .expect("hip 应是合法的 ROCm CLI 别名");
+        let Command::Find(arguments) = cli.command else {
+            panic!("应解析为 find 子命令");
+        };
+        assert_eq!(arguments.accelerator, Some(AcceleratorKind::Rocm));
+    }
 }

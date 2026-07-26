@@ -1,3 +1,4 @@
+mod accelerator;
 mod cli;
 mod config;
 mod domain;
@@ -12,6 +13,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use serde_json::json;
 
+use crate::accelerator::{AcceleratorKind, SearchAccelerator};
 use crate::cli::{Cli, Command, FilterArgs, ListKind};
 use crate::config::{CompiledFilter, FileConfig, conditions_from_flags, load_file};
 use crate::engine::{
@@ -36,8 +38,10 @@ fn run() -> Result<bool> {
         Command::Find(arguments) => {
             let (file, filter) = load_filter(&arguments.filters)?;
             let settings = search_settings(&arguments, &file)?;
-            output::write_search_start(&settings);
-            let outcome = search(Arc::new(filter), &settings)?;
+            let accelerator =
+                SearchAccelerator::prepare(settings.accelerator, settings.gpu_device, &filter)?;
+            output::write_search_start(&settings, accelerator.info());
+            let outcome = search(Arc::new(filter), &settings, accelerator)?;
             for report in &outcome.reports {
                 output::write_seed(report, arguments.format)?;
             }
@@ -109,6 +113,11 @@ fn search_settings(arguments: &crate::cli::FindArgs, file: &FileConfig) -> Resul
             .batch_size
             .or(file.search.batch_size)
             .unwrap_or(DEFAULT_BATCH_SIZE),
+        accelerator: arguments
+            .accelerator
+            .or(file.search.accelerator)
+            .unwrap_or(AcceleratorKind::Auto),
+        gpu_device: arguments.gpu_device.or(file.search.gpu_device),
         progress: arguments.progress,
     };
     settings.validate()?;

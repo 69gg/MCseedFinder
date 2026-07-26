@@ -2,7 +2,7 @@
 name = "mcseed-finder"
 version = "0.1.0"
 edition = "2024"
-description = "Fast, multithreaded Minecraft Java seed finder"
+description = "Fast, multithreaded and optionally GPU-accelerated Minecraft Java seed finder"
 license = "MIT"
 repository = "https://github.com/69gg/MCseedFinder"
 build = "build.rs"
@@ -13,6 +13,7 @@ include = [
     "/README.md",
     "/THIRD_PARTY_NOTICES.md",
     "/build.rs",
+    "/docs/**",
     "/examples/**",
     "/native/**",
     "/scripts/**",
@@ -21,6 +22,11 @@ include = [
     "/tools/*.py",
     "/vendor/cubiomes/**",
 ]
+
+[features]
+default = []
+cuda = []
+rocm = []
 
 [dependencies]
 anyhow = "=1.0.103"

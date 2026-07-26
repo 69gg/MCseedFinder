@@ -1,6 +1,6 @@
 # MCSeed Finder
 
-当前面向 Minecraft Java Edition **26.2** 的纯命令行种子筛选器。它可以按出生生物群系、周边生物群系、三维度结构，以及结构内部的具体部件组合筛选种子；例如村庄铁匠铺和各类房屋、沉船变体、埋藏宝藏箱、最近要塞传送门的已有末影之眼或末地船。
+当前面向 Minecraft Java Edition **26.2** 的纯命令行种子筛选器。它可以按出生生物群系、周边生物群系、三维度结构，以及结构内部的具体部件组合筛选种子；例如村庄铁匠铺和各类房屋、沉船变体、埋藏宝藏箱、最近要塞传送门的已有末影之眼或末地船。搜索默认使用多核 CPU，也可以在 Linux x86_64 上选择 CUDA 或 ROCm/HIP 加速。
 
 世界生成核心随项目一起放在 `vendor/cubiomes/`，构建时编译为本地静态代码。程序的构建、运行和测试都不会读取 `sources/`、Minecraft JAR、游戏安装目录或其他被 Git 忽略的输入。
 
@@ -14,6 +14,18 @@ cargo build --release
 ```
 
 第一次构建需要从 crates.io 获取 Rust 通用依赖。Minecraft 世界生成实现已经纳入仓库，不会在构建或运行时下载游戏文件。
+
+默认构建不依赖任何 GPU SDK。Linux x86_64 可以按显卡平台构建一个 GPU 变体；两个 feature 互斥：
+
+```bash
+# NVIDIA：需要 CUDA Toolkit（nvcc）
+cargo build --release --features cuda
+
+# AMD：需要 ROCm HIP SDK（hipcc）
+cargo build --release --features rocm
+```
+
+构建脚本会从 `PATH` 查找 `nvcc`/`hipcc`，也接受 `NVCC` 或 `HIPCC` 指定编译器。GPU 变体仍保留完整 CPU 搜索路径；默认 `--accelerator auto` 会在有可下推条件且设备可用时启用已编译的后端，否则说明原因并回退 CPU。完整的构建要求、工作方式和调优建议见 [GPU 加速说明](docs/GPU.md)。
 
 ## 常用命令
 
@@ -88,6 +100,21 @@ mcseed-finder find \
   --progress
 ```
 
+GPU 变体使用 `auto`、`cuda` 或 `rocm`，`hip` 是 `rocm` 的别名；多卡机器可指定设备索引：
+
+```bash
+mcseed-finder find \
+  --random \
+  --count 5 \
+  --accelerator rocm \
+  --gpu-device 0 \
+  --structure-near ruined_portal:256 \
+  --piece-near village:blacksmith:512 \
+  --progress
+```
+
+GPU 先批量检查结构的随机放置候选；出生点锚定条件会先用严格扩大半径粗筛，只为幸存者计算完整出生点，再按原半径精筛。CPU 多线程最后执行生物群系、地形、Jigsaw 子部件等完整校验。因此输出与 CPU 路径保持同一语义，不会把仅通过放置候选的种子直接当成结果。
+
 搜索周边生物群系：
 
 ```bash
@@ -115,6 +142,8 @@ mcseed-finder check 0 --biome-near overworld:sulfur_caves:1024:-64..64
 - `--count N` 指定目标结果数。随机模式省略 `--max-attempts` 时会持续搜索到找满，或在理论上遍历完全部 2^64 个种子；可以随时按 Ctrl+C 停止。
 - `--threads N` 控制并行度，默认使用 `available_parallelism` 返回的可用逻辑 CPU 数。工作线程和各自的世界生成上下文会在整次搜索中复用。
 - `--batch-size` 控制任务派发粒度，默认 4096。通常无需调整；更小的值会缩短停止响应批次，更大的值适合单个条件非常便宜的搜索。
+- `--accelerator auto|cpu|cuda|rocm` 控制搜索后端。`auto` 是默认值；显式选择 CUDA/ROCm 时，后端未编译、设备不可用或条件无法安全下推都会直接报错。
+- `--gpu-device INDEX` 选择 GPU，默认是 0；它不能和 `--accelerator cpu` 一起使用。CPU 线程仍负责出生点准备和精确复核，因此 GPU 模式下 `--threads` 依然有效。
 - `--format jsonl` 适合交给其他程序继续处理。匹配失败时 `check` 和没有结果的 `find` 返回退出码 1，参数或运行错误返回 2。
 
 ## JSON 配置
@@ -139,7 +168,8 @@ mcseed-finder find --config examples/stronghold_eyes.json
     "end": 1000000,
     "results": 5,
     "threads": 8,
-    "batch_size": 4096
+    "batch_size": 4096,
+    "accelerator": "auto"
   },
   "conditions": [
     {
@@ -177,6 +207,8 @@ mcseed-finder find --config examples/stronghold_eyes.json
   ]
 }
 ```
+
+`search.accelerator` 接受 `auto`、`cpu`、`cuda`、`rocm`（以及 `hip` 别名），`search.gpu_device` 是可选的非负设备索引。命令行值优先于 JSON。
 
 JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`end`：
 
@@ -226,6 +258,8 @@ JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`en
 
 名称不需要猜：用 `list pieces --structure STRUCTURE` 获取程序实际接受的分组和精确名称。
 
+GPU 预筛选覆盖注册表中采用随机分区放置的 20 个结构族；废弃矿井和要塞没有这种放置模型，继续由 CPU 处理。它会自动提取必须成立的正向 `structure_near` 条件，以及正向 `structure_piece_near` 所必需的父结构候选。`any`、`not`、纯上限/排除条件不会被不安全地下推；不能加速的条件始终留在 CPU 精确路径中。
+
 如果要在游戏中长期使用找到的种子，建议先用 `check` 保存见证坐标，再在原版 26.2 中做一次最终确认。
 
 ## 测试
@@ -234,9 +268,13 @@ JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`en
 cargo test --offline
 cargo clippy --all-targets --offline -- -D warnings
 sh scripts/test-native-sanitizer.sh
+
+# 安装对应 SDK 后额外验证 GPU 变体
+cargo test --offline --features cuda
+cargo test --offline --features rocm
 ```
 
-最后一条命令需要 Clang，并用 AddressSanitizer 与 UndefinedBehaviorSanitizer 独立检查 C 世界生成桥接。测试覆盖配置严格校验、名称注册表、村庄铁匠铺/房屋的确定性布局、沉船与宝藏部件、最近要塞的眼框掩码、26.2 新生物群系、全部结构族、负坐标下界投影、并行搜索顺序、随机全排列、跨线程结果一致性、CLI JSON 输出和已知种子回归值。
+`scripts/test-native-sanitizer.sh` 需要 Clang，并用 AddressSanitizer 与 UndefinedBehaviorSanitizer 独立检查 C 世界生成桥接和共享的 GPU 放置参考实现；默认同时启用 LeakSanitizer。若运行环境处于 ptrace 下而无法启动 LSan，可设置 `MCSEED_ASAN_DETECT_LEAKS=0`，地址与未定义行为检查仍会执行。测试覆盖配置严格校验、名称注册表、村庄铁匠铺/房屋的确定性布局、沉船与宝藏部件、最近要塞的眼框掩码、26.2 新生物群系、全部结构族、负坐标下界投影、并行搜索顺序、随机全排列、跨线程结果一致性、GPU 保守性与设备内核一致性、CLI JSON 输出和已知种子回归值。
 
 ## 扩展 Minecraft 版本
 

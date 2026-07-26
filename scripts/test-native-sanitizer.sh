@@ -5,6 +5,15 @@ project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 sanitizer_binary=$(mktemp "${TMPDIR:-/tmp}/mcseed-native-asan.XXXXXX")
 trap 'rm -f -- "$sanitizer_binary"' EXIT HUP INT TERM
 
+detect_leaks=${MCSEED_ASAN_DETECT_LEAKS:-1}
+case "$detect_leaks" in
+    0|1) ;;
+    *)
+        echo "MCSEED_ASAN_DETECT_LEAKS 只能是 0 或 1" >&2
+        exit 2
+        ;;
+esac
+
 cd "$project_root"
 
 # Cubiomes intentionally stores ABI-compatible RNG callbacks behind generic function pointers.
@@ -23,6 +32,7 @@ clang \
     -I native \
     -I vendor/cubiomes \
     native/bridge.c \
+    native/gpu/reference.c \
     native/jigsaw.c \
     vendor/cubiomes/biomenoise.c \
     vendor/cubiomes/biomes.c \
@@ -39,6 +49,6 @@ clang \
     -lm \
     -o "$sanitizer_binary"
 
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+ASAN_OPTIONS="detect_leaks=${detect_leaks}:abort_on_error=1" \
 UBSAN_OPTIONS=halt_on_error=1 \
     "$sanitizer_binary"

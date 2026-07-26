@@ -365,11 +365,135 @@ fn random_only_options_reject_sequential_or_mixed_modes() {
 }
 
 #[test]
+fn cpu_accelerator_rejects_a_gpu_device_and_reports_selection() {
+    let invalid = run(&[
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "1",
+        "--accelerator",
+        "cpu",
+        "--gpu-device",
+        "0",
+    ]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("gpu-device"));
+
+    let cpu = run(&[
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "1",
+        "--accelerator",
+        "cpu",
+        "--format",
+        "jsonl",
+    ]);
+    assert!(cpu.status.success());
+    assert!(String::from_utf8_lossy(&cpu.stderr).contains("搜索后端：cpu"));
+
+    let portable_auto = run(&[
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "1",
+        "--accelerator",
+        "auto",
+        "--gpu-device",
+        "0",
+        "--structure-near",
+        "village:1024",
+        "--format",
+        "jsonl",
+    ]);
+    assert!(
+        portable_auto.status.success(),
+        "{}",
+        String::from_utf8_lossy(&portable_auto.stderr)
+    );
+}
+
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+#[test]
+fn explicit_gpu_acceleration_requires_a_gpu_build() {
+    let output = run(&[
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "1",
+        "--accelerator",
+        "cuda",
+        "--structure-near",
+        "village:128",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--features cuda"));
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[test]
+fn compiled_gpu_search_matches_cpu_on_a_small_fixed_range_when_available() {
+    let backend = if cfg!(feature = "cuda") {
+        "cuda"
+    } else {
+        "rocm"
+    };
+    let common = [
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "64",
+        "--count",
+        "5",
+        "--threads",
+        "4",
+        "--batch-size",
+        "32",
+        "--structure-near",
+        "village:1024",
+        "--format",
+        "jsonl",
+    ];
+    let mut cpu_arguments = common.to_vec();
+    cpu_arguments.extend(["--accelerator", "cpu"]);
+    let mut gpu_arguments = common.to_vec();
+    gpu_arguments.extend(["--accelerator", backend]);
+    let cpu = run(&cpu_arguments);
+    let gpu = run(&gpu_arguments);
+    if gpu.status.code() == Some(2) {
+        let stderr = String::from_utf8_lossy(&gpu.stderr);
+        if stderr.contains("没有检测到")
+            || stderr.contains("运行时不可用")
+            || stderr.contains("检测 GPU 设备失败")
+        {
+            return;
+        }
+    }
+    assert!(cpu.status.success());
+    assert!(
+        gpu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gpu.stderr)
+    );
+    assert_eq!(json_lines(&gpu), json_lines(&cpu));
+    let gpu_stderr = String::from_utf8_lossy(&gpu.stderr);
+    assert!(gpu_stderr.contains(&format!("搜索后端：{backend}:")));
+    assert!(gpu_stderr.contains("GPU 出生点粗筛："));
+    assert!(gpu_stderr.contains("GPU 预筛选："));
+}
+
+#[test]
 fn build_and_runtime_inputs_do_not_reference_ignored_game_sources() {
     let tracked_inputs = [
         include_str!("../Cargo.toml"),
         include_str!("../build.rs"),
         include_str!("../src/main.rs"),
+        include_str!("../src/accelerator.rs"),
         include_str!("../src/cli.rs"),
         include_str!("../src/config.rs"),
         include_str!("../src/engine.rs"),
@@ -379,6 +503,10 @@ fn build_and_runtime_inputs_do_not_reference_ignored_game_sources() {
         include_str!("../native/jigsaw.c"),
         include_str!("../native/jigsaw.h"),
         include_str!("../native/version.h"),
+        include_str!("../native/gpu/abi.h"),
+        include_str!("../native/gpu/placement.h"),
+        include_str!("../native/gpu/reference.c"),
+        include_str!("../native/gpu/backend.cu"),
         include_str!("../native/generated/village_26_2.inc"),
     ];
     for input in tracked_inputs {
