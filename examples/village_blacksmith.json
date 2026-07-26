@@ -1,0 +1,20 @@
+{
+  "version": "26.2",
+  "search": {
+    "start": 0,
+    "end": 100000,
+    "results": 5,
+    "threads": 8,
+    "batch_size": 256
+  },
+  "conditions": [
+    {
+      "type": "structure_piece_near",
+      "structure": "village",
+      "any_of": ["blacksmith"],
+      "anchor": "spawn",
+      "radius": 1024,
+      "min_count": 1
+    }
+  ]
+}

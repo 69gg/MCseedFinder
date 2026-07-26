@@ -7,15 +7,23 @@ trap 'rm -f -- "$sanitizer_binary"' EXIT HUP INT TERM
 
 cd "$project_root"
 
+# Cubiomes intentionally stores ABI-compatible RNG callbacks behind generic function pointers.
 clang \
     -std=c11 \
     -O1 \
     -g \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -Wno-unused-parameter \
+    -Wno-unused-function \
     -fno-omit-frame-pointer \
-    -fsanitize=address \
+    -fsanitize=address,undefined \
+    -fno-sanitize=function \
     -I native \
     -I vendor/cubiomes \
     native/bridge.c \
+    native/jigsaw.c \
     vendor/cubiomes/biomenoise.c \
     vendor/cubiomes/biomes.c \
     vendor/cubiomes/finders.c \
@@ -31,4 +39,6 @@ clang \
     -lm \
     -o "$sanitizer_binary"
 
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 "$sanitizer_binary"
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+    "$sanitizer_binary"

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::domain::Dimension;
 use crate::native::{self, BiomeInfo, StructureInfo};
 
-pub const MINECRAFT_VERSION: &str = "26.2";
+pub const MINECRAFT_VERSION: &str = env!("MCSEED_MINECRAFT_VERSION");
 pub const MAX_RADIUS: u32 = 30_000_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -85,6 +85,19 @@ pub enum ConditionSpec {
         #[serde(default)]
         max_count: Option<u64>,
     },
+    #[serde(alias = "substructure_near")]
+    StructurePieceNear {
+        structure: String,
+        #[serde(alias = "pieces")]
+        any_of: Vec<String>,
+        #[serde(default)]
+        anchor: Option<AnchorSpec>,
+        radius: u32,
+        #[serde(default = "default_min_count")]
+        min_count: u64,
+        #[serde(default)]
+        max_count: Option<u64>,
+    },
     All {
         conditions: Vec<ConditionSpec>,
     },
@@ -141,6 +154,14 @@ pub enum CompiledCondition {
     StructureNear {
         dimension: Dimension,
         targets: Vec<StructureInfo>,
+        anchor: Anchor,
+        radius: u32,
+        min_count: u64,
+        max_count: Option<u64>,
+    },
+    StructurePieceNear {
+        parent: StructureInfo,
+        selectors: Vec<String>,
         anchor: Anchor,
         radius: u32,
         min_count: u64,
@@ -205,6 +226,7 @@ pub fn conditions_from_flags(
     spawn_biomes: &[String],
     biome_near: &[String],
     structure_near: &[String],
+    piece_near: &[String],
 ) -> Result<Vec<ConditionSpec>> {
     let mut conditions = Vec::new();
     if !spawn_biomes.is_empty() {
@@ -216,6 +238,9 @@ pub fn conditions_from_flags(
     }
     for specification in structure_near {
         conditions.push(parse_structure_near(specification)?);
+    }
+    for specification in piece_near {
+        conditions.push(parse_piece_near(specification)?);
     }
     Ok(conditions)
 }
@@ -263,6 +288,27 @@ fn parse_structure_near(value: &str) -> Result<ConditionSpec> {
     Ok(ConditionSpec::StructureNear {
         dimension: None,
         any_of: split_names(std::iter::once(names))?,
+        anchor: None,
+        radius: parse_radius(radius, value)?,
+        min_count: default_min_count(),
+        max_count: None,
+    })
+}
+
+fn parse_piece_near(value: &str) -> Result<ConditionSpec> {
+    let (head, radius) = value.rsplit_once(':').ok_or_else(|| {
+        anyhow!("子结构条件 {value:?} 格式错误；应为 STRUCTURE:PIECE[,PIECE]:RADIUS")
+    })?;
+    let head = head.strip_prefix("minecraft:").unwrap_or(head);
+    let (structure, pieces) = head.split_once(':').ok_or_else(|| {
+        anyhow!("子结构条件 {value:?} 格式错误；应为 STRUCTURE:PIECE[,PIECE]:RADIUS")
+    })?;
+    if structure.trim().is_empty() {
+        bail!("子结构条件 {value:?} 的父结构不能为空");
+    }
+    Ok(ConditionSpec::StructurePieceNear {
+        structure: structure.trim().to_owned(),
+        any_of: split_names(std::iter::once(pieces))?,
         anchor: None,
         radius: parse_radius(radius, value)?,
         min_count: default_min_count(),
@@ -336,6 +382,37 @@ fn compile_condition(specification: ConditionSpec) -> Result<CompiledCondition> 
                 dimension,
                 targets,
                 anchor: compile_anchor(anchor, dimension)?,
+                radius,
+                min_count,
+                max_count,
+            })
+        }
+        ConditionSpec::StructurePieceNear {
+            structure,
+            any_of,
+            anchor,
+            radius,
+            min_count,
+            max_count,
+        } => {
+            validate_radius(radius)?;
+            validate_counts(min_count, max_count)?;
+            let parent = native::structure_by_name(&structure)?;
+            if any_of.is_empty() {
+                bail!("子结构选择器列表不能为空");
+            }
+            let mut seen = HashSet::new();
+            let selectors = any_of
+                .into_iter()
+                .map(|name| native::piece_selector(parent.id, &name))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|name| seen.insert(name.clone()))
+                .collect::<Vec<_>>();
+            Ok(CompiledCondition::StructurePieceNear {
+                anchor: compile_anchor(anchor, parent.dimension)?,
+                parent,
+                selectors,
                 radius,
                 min_count,
                 max_count,
@@ -550,6 +627,13 @@ fn condition_cost(condition: &CompiledCondition) -> u8 {
                 2
             }
         }
+        CompiledCondition::StructurePieceNear { parent, .. } => {
+            if parent.name == "stronghold" {
+                5
+            } else {
+                4
+            }
+        }
         CompiledCondition::BiomeNear { .. } => 3,
         CompiledCondition::All(children) | CompiledCondition::Any(children) => {
             children.iter().map(condition_cost).min().unwrap_or(1)
@@ -618,13 +702,14 @@ mod tests {
             &["plains,forest".to_owned()],
             &["nether:warped_forest,crimson_forest:256:32..96".to_owned()],
             &["village:512".to_owned(), "fortress,bastion:256".to_owned()],
+            &["village:blacksmith,library:1024".to_owned()],
         )
         .expect("CLI 条件应可解析");
         let filter = CompiledFilter::compile(specs).expect("条件应可编译");
         let CompiledCondition::All(conditions) = filter.root else {
             panic!("根条件应为 all");
         };
-        assert_eq!(conditions.len(), 4);
+        assert_eq!(conditions.len(), 5);
         assert!(conditions.iter().any(|condition| matches!(
             condition,
             CompiledCondition::StructureNear {
@@ -641,6 +726,7 @@ mod tests {
             include_str!("../examples/advanced.json"),
             include_str!("../examples/sulfur_caves.json"),
             include_str!("../examples/random_search.json"),
+            include_str!("../examples/village_blacksmith.json"),
         ];
         for json in examples {
             let file: FileConfig = serde_json::from_str(json).expect("示例 JSON 应有效");

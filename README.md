@@ -1,6 +1,6 @@
 # MCSeed Finder
 
-面向 Minecraft Java Edition **26.2** 的纯命令行种子筛选器。它可以按出生生物群系、出生点周边生物群系、主世界结构、出生点投影到下界后的附近结构，以及末地结构组合筛选种子。
+当前面向 Minecraft Java Edition **26.2** 的纯命令行种子筛选器。它可以按出生生物群系、周边生物群系、三维度结构，以及结构内部的具体部件组合筛选种子；例如村庄铁匠铺和各类房屋、沉船变体、埋藏宝藏箱、要塞传送门房或末地船。
 
 世界生成核心随项目一起放在 `vendor/cubiomes/`，构建时编译为本地静态代码。程序的构建、运行和测试都不会读取 `sources/`、Minecraft JAR、游戏安装目录或其他被 Git 忽略的输入。
 
@@ -23,12 +23,29 @@ cargo build --release
 mcseed-finder list biomes
 mcseed-finder list structures
 mcseed-finder list structures --json
+mcseed-finder list pieces --structure village
+mcseed-finder list pieces --structure shipwreck --json
 ```
 
 检查单个种子：
 
 ```bash
 mcseed-finder check 0 --spawn-biome plains,forest
+```
+
+检查出生点 1024 格内的村庄是否包含铁匠铺。现代村庄中的 `blacksmith` 分组包含盔甲匠、武器匠和工具匠房屋：
+
+```bash
+mcseed-finder check 0 --piece-near village:blacksmith:1024
+```
+
+也可以寻找任一房屋、指定模板、完整沉船或埋藏宝藏箱：
+
+```bash
+mcseed-finder find --piece-near village:house:1024 --count 5
+mcseed-finder find --piece-near village:village/plains/houses/plains_library_1:1024
+mcseed-finder find --piece-near shipwreck:full:4096
+mcseed-finder find --piece-near buried_treasure:buried_treasure/chest:4096
 ```
 
 搜索出生在平原或森林、出生点 1024 格内有村庄，并且进入下界后 512 格内有堡垒或堡垒遗迹的种子：
@@ -82,6 +99,7 @@ mcseed-finder check 0 --biome-near overworld:sulfur_caves:1024:-64..64
 - `--spawn-biome BIOME[,BIOME]`：逗号内为“任一”。
 - `--biome-near DIMENSION:BIOME[,BIOME]:RADIUS[:Y|Y_MIN..Y_MAX]`。
 - `--structure-near STRUCTURE[,STRUCTURE]:RADIUS`：结构自身决定维度；主世界默认以出生点为中心，下界默认以 `floor(spawn / 8)` 为中心，末地默认以 `(0, 0)` 为中心。
+- `--piece-near STRUCTURE:PIECE[,PIECE]:RADIUS`：逗号内为“任一子部件”；`--substructure-near` 是等价别名。半径判断父结构起点，命中同时报告具体部件坐标与父结构起点。
 - 同一种快捷参数可以重复，重复的条件之间为“并且”。
 - 顺序模式使用半开区间 `[start, end)`；每批结果会按遍历位置合并，因此不同线程数会返回相同的最小匹配种子。
 - `find --random` 使用完整有符号 64 位种子空间的伪随机全排列，不会重复抽取种子。省略 `--random-seed` 时会生成随机化键并立即写到 stderr；使用相同键和条件可以复现相同结果顺序。
@@ -99,6 +117,7 @@ mcseed-finder check 0 --biome-near overworld:sulfur_caves:1024:-64..64
 mcseed-finder find --config examples/village_and_nether.json
 mcseed-finder check 0 --config examples/village_and_nether.json --format jsonl
 mcseed-finder find --config examples/random_search.json
+mcseed-finder find --config examples/village_blacksmith.json
 ```
 
 基本格式：
@@ -121,6 +140,14 @@ mcseed-finder find --config examples/random_search.json
     {
       "type": "structure_near",
       "any_of": ["village"],
+      "radius": 1024,
+      "min_count": 1
+    },
+    {
+      "type": "structure_piece_near",
+      "structure": "village",
+      "any_of": ["blacksmith"],
+      "anchor": "spawn",
       "radius": 1024,
       "min_count": 1
     },
@@ -156,6 +183,7 @@ JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`en
 - `spawn_biome`：字段 `any_of`。
 - `biome_near`：字段 `dimension`、`any_of`、`radius`，可选 `anchor`、`y` 或 `y_min`/`y_max`、`min_count`、`max_count`。
 - `structure_near`：字段 `any_of`、`radius`，可选 `dimension`、`anchor`、`min_count`、`max_count`。
+- `structure_piece_near`（别名 `substructure_near`）：字段 `structure`、`any_of`、`radius`，可选 `anchor`、`min_count`、`max_count`。计数对象是匹配的部件实例，不是父结构数量。
 - `all` / `any`：字段 `conditions`，可任意递归组合。
 - `not`：字段 `condition`。
 
@@ -168,7 +196,18 @@ JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`en
 - 生物群系范围按 Minecraft 的 4×4×4 噪声生物群系单元扫描；圆形半径按水平方块距离判断。跨 Y 范围会检查所有相交的生物群系单元。
 - 出生位置使用 26.2 气候适应度搜索和近似地表检查；出生生物群系会在求得的近似地表 Y 上以方块分辨率读取，避免把地下洞穴群系当成地表出生群系。由于不生成完整方块区块，极少数种子的最终落脚方块仍可能与游戏有少量偏差。
 - 大部分结构会执行随机放置、生物群系和已实现的地形可用性检查。沙漠神殿、丛林神庙、林地府邸的地表高度是近似检查；废弃传送门和下界化石还可能因完整区块内部地形而生成失败。`list structures` 会逐项显示精度等级。
+- 村庄部件使用从对应版本原版数据提取的模板池权重、模板尺寸和 Jigsaw 连接点，并复现旧式随机源、连接优先级、旋转、碰撞、回退池及最大深度。水平布局与随机序列按 26.2 实现；`WORLD_SURFACE_WG` 使用随项目编译的地形噪声近似，因此极端地形中的 Y 坐标或后续分支可能出现偏差。`list pieces` 会逐项显示这一精度。
 - 这里筛选的是默认世界类型；不支持大型生物群系、数据包改写的世界生成或自定义维度。
+
+当前可查询的子部件范围：
+
+- 村庄：`blacksmith`、`house`、`profession_house`、`residential`、全部村民职业（同时接受 `librarian`/`library`、`cleric`/`temple` 等职业名和建筑名）、农田、畜栏、马厩、大小房屋、集会点、街道、装饰、僵尸村庄等分组，以及 491 个完整模板/特征名称。
+- 沉船：完整、前半、后半、桅杆、完好、破损分组及全部 20 个模板变体；埋藏宝藏可查 `buried_treasure/chest`。
+- 下界要塞、要塞和末地城：底层提供的全部部件类型，并提供 `blaze_spawner`、`nether_wart_room`、`portal_room`、`library`、`ship` 等常用分组。
+- 雪屋、沙漠神殿、丛林神庙、沼泽小屋，以及主世界/下界废弃传送门的已知模板均可查询。
+- 掠夺者前哨站目前只提供瞭望塔；堡垒遗迹目前只提供底层稳定实现的四个必有部件，二者在列表中标为 `partial`。矿井、林地府邸、海底神殿、海底废墟、远古城市、古迹废墟、试炼密室和下界化石目前仅支持父结构搜索。
+
+名称不需要猜：用 `list pieces --structure STRUCTURE` 获取程序实际接受的分组和精确名称。
 
 如果要在游戏中长期使用找到的种子，建议先用 `check` 保存见证坐标，再在原版 26.2 中做一次最终确认。
 
@@ -180,7 +219,20 @@ cargo clippy --all-targets --offline -- -D warnings
 sh scripts/test-native-sanitizer.sh
 ```
 
-最后一条命令需要 Clang，并用 AddressSanitizer 独立检查 C 世界生成桥接。测试覆盖配置严格校验、名称注册表、26.2 新生物群系、全部结构族、负坐标下界投影、并行搜索顺序、随机全排列的无重复样本、跨线程随机结果一致性、结果数量、CLI JSON 输出和已知种子回归值。
+最后一条命令需要 Clang，并用 AddressSanitizer 与 UndefinedBehaviorSanitizer 独立检查 C 世界生成桥接。测试覆盖配置严格校验、名称注册表、村庄铁匠铺/房屋的确定性布局、沉船与宝藏部件、26.2 新生物群系、全部结构族、负坐标下界投影、并行搜索顺序、随机全排列、跨线程结果一致性、CLI JSON 输出和已知种子回归值。
+
+## 扩展 Minecraft 版本
+
+当前版本配置集中在 `native/version.h`；Rust 输出版本会在构建时从这里读取。村庄数据按版本放在 `native/generated/`，Jigsaw 查询接口本身接收版本标签。新增版本时，应先验证 Cubiomes 对应版本，再从合法取得的客户端 JAR 生成紧凑元数据：
+
+```bash
+python3 tools/extract_jigsaw.py \
+  --jar /path/to/client.jar \
+  --version 26.2 \
+  --output native/generated/village_26_2.inc
+```
+
+生成文件只包含池权重、尺寸和连接点；将它纳入 `native/jigsaw.c` 的版本注册表后提交。提取脚本和 JAR 都不会在构建、测试或运行时执行/读取。
 
 ## 第三方代码
 

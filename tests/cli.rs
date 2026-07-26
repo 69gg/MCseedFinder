@@ -34,6 +34,58 @@ fn lists_all_26_2_structure_families() {
 }
 
 #[test]
+fn lists_village_groups_and_exact_piece_names() {
+    let output = run(&["list", "pieces", "--structure", "village", "--json"]);
+    assert!(output.status.success());
+    let entries: Vec<Value> = serde_json::from_slice(&output.stdout).expect("村庄子结构列表 JSON");
+    assert!(entries.len() > 500);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| { entry["name"] == "blacksmith" && entry["kind"] == "group" })
+    );
+    assert!(entries.iter().any(|entry| {
+        entry["name"] == "village/plains/houses/plains_weaponsmith_1" && entry["kind"] == "piece"
+    }));
+}
+
+#[test]
+fn checks_known_village_blacksmith_and_reports_its_parent() {
+    let output = run(&[
+        "check",
+        "0",
+        "--piece-near",
+        "village:blacksmith:1024",
+        "--format",
+        "jsonl",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = &json_lines(&output)[0];
+    let condition = &report["filter"]["children"][0];
+    assert_eq!(condition["condition"], "structure_piece_near");
+    assert_eq!(
+        condition["hits"][0]["name"],
+        "village/plains/houses/plains_weaponsmith_1"
+    );
+    assert_eq!(condition["hits"][0]["position"]["x"], 267);
+    assert_eq!(condition["hits"][0]["position"]["y"], 71);
+    assert_eq!(condition["hits"][0]["position"]["z"], 960);
+    assert_eq!(condition["hits"][0]["parent_position"]["x"], 272);
+    assert_eq!(condition["hits"][0]["parent_position"]["z"], 944);
+}
+
+#[test]
+fn rejects_a_piece_selector_not_owned_by_the_parent_structure() {
+    let output = run(&["check", "0", "--piece-near", "shipwreck:blacksmith:1024"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("不支持子结构选择器"));
+}
+
+#[test]
 fn checks_known_seed_with_tracked_example_config() {
     let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/village_and_nether.json");
     let output = Command::new(env!("CARGO_BIN_EXE_mcseed-finder"))
@@ -89,6 +141,42 @@ fn parallel_search_keeps_numeric_result_order() {
         .collect();
     assert_eq!(single_seeds, vec![0, 1, 2]);
     assert_eq!(parallel_seeds, single_seeds);
+}
+
+#[test]
+fn village_piece_search_is_reproducible_across_threads() {
+    let common = [
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "16",
+        "--count",
+        "3",
+        "--batch-size",
+        "4",
+        "--piece-near",
+        "village:blacksmith:1024",
+        "--format",
+        "jsonl",
+    ];
+    let mut single_arguments = common.to_vec();
+    single_arguments.extend(["--threads", "1"]);
+    let mut parallel_arguments = common.to_vec();
+    parallel_arguments.extend(["--threads", "4"]);
+
+    let single = run(&single_arguments);
+    let parallel = run(&parallel_arguments);
+    assert!(single.status.success());
+    assert!(parallel.status.success());
+    let seeds = |output: &Output| -> Vec<i64> {
+        json_lines(output)
+            .iter()
+            .map(|value| value["seed"].as_i64().expect("seed"))
+            .collect()
+    };
+    assert_eq!(seeds(&single).len(), 3);
+    assert_eq!(seeds(&single), seeds(&parallel));
 }
 
 #[test]
@@ -221,6 +309,10 @@ fn build_and_runtime_inputs_do_not_reference_ignored_game_sources() {
         include_str!("../src/native.rs"),
         include_str!("../src/output.rs"),
         include_str!("../native/bridge.c"),
+        include_str!("../native/jigsaw.c"),
+        include_str!("../native/jigsaw.h"),
+        include_str!("../native/version.h"),
+        include_str!("../native/generated/village_26_2.inc"),
     ];
     for input in tracked_inputs {
         assert!(!input.contains("sources/"));

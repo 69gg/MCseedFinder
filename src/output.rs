@@ -82,9 +82,13 @@ fn write_condition(output: &mut impl Write, report: &ConditionReport, depth: usi
             .y
             .map(|value| format!(", {value}"))
             .unwrap_or_default();
+        let parent = hit
+            .parent_position
+            .map(|position| format!("；父结构起点 ({}, {})", position.x, position.z))
+            .unwrap_or_default();
         writeln!(
             output,
-            "{indent}  - {} {} ({x}{y}, {z}) 距离 {distance:.1}",
+            "{indent}  - {} {} ({x}{y}, {z}){parent} 距离 {distance:.1}",
             hit.dimension,
             hit.name,
             x = hit.position.x,

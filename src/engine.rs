@@ -126,6 +126,8 @@ pub struct HitReport {
     pub name: String,
     pub dimension: Dimension,
     pub position: Position,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_position: Option<Position>,
     pub distance: f64,
 }
 
@@ -485,6 +487,7 @@ impl<'a> Evaluation<'a> {
                             name: target.name.clone(),
                             dimension: *dimension,
                             position: hit.position,
+                            parent_position: None,
                             distance: horizontal_distance(
                                 hit.position.x,
                                 hit.position.z,
@@ -509,6 +512,59 @@ impl<'a> Evaluation<'a> {
                     observed_count: Some(found),
                     count_is_lower_bound: lower_bound,
                     hits,
+                    children: Vec::new(),
+                });
+                Ok(ConditionOutcome { matched, report })
+            }
+            CompiledCondition::StructurePieceNear {
+                parent,
+                selectors,
+                anchor,
+                radius,
+                min_count,
+                max_count,
+            } => {
+                let (anchor_x, anchor_z) = self.resolve_anchor(*anchor)?;
+                let limit = scan_limit(*min_count, *max_count)?;
+                let scan = self.native.find_structure_pieces(
+                    parent.id, selectors, anchor_x, anchor_z, *radius, limit, collect,
+                )?;
+                let matched = count_matches(scan.found, *min_count, *max_count);
+                let report = collect.then(|| ConditionReport {
+                    condition: "structure_piece_near".to_owned(),
+                    matched,
+                    description: format!(
+                        "{} 中 {} 的子结构 [{}]；父结构起点距 {} ({anchor_x}, {anchor_z}) 不超过 {} 格；{}",
+                        parent.dimension,
+                        parent.name,
+                        join_names(selectors.iter().map(String::as_str)),
+                        anchor.label(),
+                        radius,
+                        count_description(
+                            scan.found,
+                            scan.limit_reached,
+                            *min_count,
+                            *max_count
+                        )
+                    ),
+                    observed_count: Some(scan.found),
+                    count_is_lower_bound: scan.limit_reached,
+                    hits: scan
+                        .hits
+                        .iter()
+                        .map(|hit| HitReport {
+                            name: hit.name.clone(),
+                            dimension: parent.dimension,
+                            position: hit.position,
+                            parent_position: Some(hit.parent_position),
+                            distance: horizontal_distance(
+                                hit.parent_position.x,
+                                hit.parent_position.z,
+                                anchor_x,
+                                anchor_z,
+                            ),
+                        })
+                        .collect(),
                     children: Vec::new(),
                 });
                 Ok(ConditionOutcome { matched, report })
@@ -637,6 +693,7 @@ fn biome_hit(dimension: Dimension, hit: &NativeHit, anchor_x: i32, anchor_z: i32
         name: native::biome_name(hit.id).unwrap_or_else(|| format!("biome_{}", hit.id)),
         dimension,
         position: hit.position,
+        parent_position: None,
         distance: horizontal_distance(hit.position.x, hit.position.z, anchor_x, anchor_z),
     }
 }

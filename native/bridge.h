@@ -17,6 +17,15 @@ typedef struct McSeedHit {
     int32_t id;
 } McSeedHit;
 
+typedef struct McSeedPieceHit {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    int32_t parent_x;
+    int32_t parent_z;
+    const char *name;
+} McSeedPieceHit;
+
 McSeedContext *mcseed_context_create(void);
 void mcseed_context_destroy(McSeedContext *context);
 void mcseed_context_set_seed(McSeedContext *context, uint64_t seed);
@@ -40,6 +49,13 @@ int32_t mcseed_structure_id_at(int32_t index);
 int32_t mcseed_structure_dimension_at(int32_t index);
 int32_t mcseed_structure_accuracy_at(int32_t index);
 int32_t mcseed_structure_id_from_name(const char *name);
+
+int32_t mcseed_piece_count(void);
+const char *mcseed_piece_name_at(int32_t index);
+int32_t mcseed_piece_structure_id_at(int32_t index);
+int32_t mcseed_piece_accuracy_at(int32_t index);
+int32_t mcseed_piece_is_group_at(int32_t index);
+int32_t mcseed_piece_selector_valid(int32_t structure_id, const char *name);
 
 int32_t mcseed_find_biomes(
     McSeedContext *context,
@@ -66,6 +82,25 @@ int32_t mcseed_find_structure(
     uint32_t radius,
     uint64_t limit,
     McSeedHit *hits,
+    size_t hit_capacity,
+    uint64_t *found,
+    int32_t *limit_reached
+);
+
+/**
+ * Count matching pieces in structures whose start position lies within radius.
+ * Selectors are validated with mcseed_piece_selector_valid before the scan.
+ */
+int32_t mcseed_find_structure_pieces(
+    McSeedContext *context,
+    int32_t structure_id,
+    const char *const *selectors,
+    size_t selector_count,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    uint32_t radius,
+    uint64_t limit,
+    McSeedPieceHit *hits,
     size_t hit_capacity,
     uint64_t *found,
     int32_t *limit_reached

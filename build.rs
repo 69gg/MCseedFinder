@@ -2,6 +2,21 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn minecraft_version() -> String {
+    let header = fs::read_to_string("native/version.h").expect("无法读取 native/version.h");
+    header
+        .lines()
+        .find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("#define MCSEED_VERSION_NAME ")?
+                .trim();
+            let value = value.strip_prefix('"')?.strip_suffix('"')?;
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .expect("native/version.h 缺少 MCSEED_VERSION_NAME")
+}
+
 fn collect_c_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("无法读取 {}: {error}", directory.display()))
@@ -24,8 +39,10 @@ fn collect_c_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    let minecraft_version = minecraft_version();
     let vendor_root = Path::new("vendor/cubiomes");
-    let mut sources = vec![PathBuf::from("native/bridge.c")];
+    let mut sources = Vec::new();
+    collect_c_sources(Path::new("native"), &mut sources);
     collect_c_sources(vendor_root, &mut sources);
 
     let mut build = cc::Build::new();
@@ -38,9 +55,9 @@ fn main() {
         .flag_if_supported("-fdata-sections")
         .compile("mcseed_worldgen");
 
-    println!("cargo:rerun-if-changed=native/bridge.c");
-    println!("cargo:rerun-if-changed=native/bridge.h");
+    println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-changed=vendor/cubiomes");
+    println!("cargo:rustc-env=MCSEED_MINECRAFT_VERSION={minecraft_version}");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if matches!(

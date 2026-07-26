@@ -21,6 +21,30 @@ struct RawHit {
     id: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawPieceHit {
+    x: i32,
+    y: i32,
+    z: i32,
+    parent_x: i32,
+    parent_z: i32,
+    name: *const c_char,
+}
+
+impl Default for RawPieceHit {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: i32::MIN,
+            z: 0,
+            parent_x: 0,
+            parent_z: 0,
+            name: std::ptr::null(),
+        }
+    }
+}
+
 unsafe extern "C" {
     fn mcseed_context_create() -> *mut RawContext;
     fn mcseed_context_destroy(context: *mut RawContext);
@@ -40,6 +64,13 @@ unsafe extern "C" {
     fn mcseed_structure_dimension_at(index: c_int) -> c_int;
     fn mcseed_structure_accuracy_at(index: c_int) -> c_int;
     fn mcseed_structure_id_from_name(name: *const c_char) -> c_int;
+
+    fn mcseed_piece_count() -> c_int;
+    fn mcseed_piece_name_at(index: c_int) -> *const c_char;
+    fn mcseed_piece_structure_id_at(index: c_int) -> c_int;
+    fn mcseed_piece_accuracy_at(index: c_int) -> c_int;
+    fn mcseed_piece_is_group_at(index: c_int) -> c_int;
+    fn mcseed_piece_selector_valid(structure_id: c_int, name: *const c_char) -> c_int;
 
     fn mcseed_find_biomes(
         context: *mut RawContext,
@@ -70,6 +101,21 @@ unsafe extern "C" {
         found: *mut c_ulonglong,
         limit_reached: *mut c_int,
     ) -> c_int;
+
+    fn mcseed_find_structure_pieces(
+        context: *mut RawContext,
+        structure_id: c_int,
+        selectors: *const *const c_char,
+        selector_count: usize,
+        anchor_x: c_int,
+        anchor_z: c_int,
+        radius: c_uint,
+        limit: c_ulonglong,
+        hits: *mut RawPieceHit,
+        hit_capacity: usize,
+        found: *mut c_ulonglong,
+        limit_reached: *mut c_int,
+    ) -> c_int;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +131,31 @@ pub struct StructureInfo {
     pub name: String,
     pub dimension: Dimension,
     pub accuracy: StructureAccuracy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PieceInfo {
+    pub structure_id: i32,
+    pub name: String,
+    pub accuracy: PieceAccuracy,
+    pub is_group: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieceAccuracy {
+    Exact,
+    ApproximateTerrain,
+    Partial,
+}
+
+impl PieceAccuracy {
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Exact => "部件类型与水平布局精确",
+            Self::ApproximateTerrain => "模板池与随机序列精确，地表高度近似",
+            Self::Partial => "底层只实现该结构的稳定部件子集",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +186,20 @@ pub struct ScanResult {
     pub found: u64,
     pub limit_reached: bool,
     pub hits: Vec<NativeHit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativePieceHit {
+    pub name: String,
+    pub position: Position,
+    pub parent_position: Position,
+}
+
+#[derive(Debug, Clone)]
+pub struct PieceScanResult {
+    pub found: u64,
+    pub limit_reached: bool,
+    pub hits: Vec<NativePieceHit>,
 }
 
 pub struct NativeContext {
@@ -228,6 +313,84 @@ impl NativeContext {
         ensure_status(status, "扫描结构")?;
         Ok(scan_result(raw_hits, found, limit_reached))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_structure_pieces(
+        &mut self,
+        structure_id: i32,
+        selectors: &[String],
+        anchor_x: i32,
+        anchor_z: i32,
+        radius: u32,
+        limit: u64,
+        collect_hits: bool,
+    ) -> Result<PieceScanResult> {
+        if selectors.is_empty() {
+            bail!("子结构选择器不能为空");
+        }
+        let selectors = selectors
+            .iter()
+            .map(|selector| CString::new(selector.as_str()).context("子结构选择器包含 NUL 字符"))
+            .collect::<Result<Vec<_>>>()?;
+        let selector_pointers: Vec<*const c_char> =
+            selectors.iter().map(|selector| selector.as_ptr()).collect();
+        let mut raw_hits = if collect_hits {
+            vec![RawPieceHit::default(); HIT_CAPACITY]
+        } else {
+            Vec::new()
+        };
+        let mut found = 0;
+        let mut limit_reached = 0;
+        let (hits_pointer, hit_capacity) = if raw_hits.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (raw_hits.as_mut_ptr(), raw_hits.len())
+        };
+        let status = unsafe {
+            mcseed_find_structure_pieces(
+                self.raw.as_ptr(),
+                structure_id,
+                selector_pointers.as_ptr(),
+                selector_pointers.len(),
+                anchor_x,
+                anchor_z,
+                radius,
+                limit,
+                hits_pointer,
+                hit_capacity,
+                &mut found,
+                &mut limit_reached,
+            )
+        };
+        ensure_status(status, "扫描结构子部件")?;
+        let stored = usize::try_from(found)
+            .unwrap_or(usize::MAX)
+            .min(raw_hits.len());
+        let hits = raw_hits
+            .into_iter()
+            .take(stored)
+            .map(|hit| {
+                Ok(NativePieceHit {
+                    name: required_c_string(hit.name)?,
+                    position: Position {
+                        x: hit.x,
+                        y: (hit.y != i32::MIN).then_some(hit.y),
+                        z: hit.z,
+                    },
+                    parent_position: Position {
+                        x: hit.parent_x,
+                        y: None,
+                        z: hit.parent_z,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PieceScanResult {
+            found,
+            limit_reached: limit_reached != 0,
+            hits,
+        })
+    }
 }
 
 impl Drop for NativeContext {
@@ -281,6 +444,35 @@ pub fn structures() -> Result<Vec<StructureInfo>> {
         .collect()
 }
 
+pub fn pieces() -> Result<Vec<PieceInfo>> {
+    let count = unsafe { mcseed_piece_count() };
+    if count < 0 {
+        bail!("读取子结构列表失败");
+    }
+    (0..count)
+        .map(|index| {
+            let structure_id = unsafe { mcseed_piece_structure_id_at(index) };
+            let accuracy = match unsafe { mcseed_piece_accuracy_at(index) } {
+                0 => PieceAccuracy::Exact,
+                1 => PieceAccuracy::ApproximateTerrain,
+                2 => PieceAccuracy::Partial,
+                value => bail!("子结构注册项 {index} 的精度等级无效：{value}"),
+            };
+            let is_group = match unsafe { mcseed_piece_is_group_at(index) } {
+                0 => false,
+                1 => true,
+                value => bail!("子结构注册项 {index} 的分组标志无效：{value}"),
+            };
+            Ok(PieceInfo {
+                structure_id,
+                name: required_c_string(unsafe { mcseed_piece_name_at(index) })?,
+                accuracy,
+                is_group,
+            })
+        })
+        .collect()
+}
+
 pub fn biome_by_name(name: &str) -> Result<BiomeInfo> {
     let normalized = normalize_resource_name(name);
     let c_name = CString::new(normalized.as_str()).context("生物群系名称包含 NUL 字符")?;
@@ -306,6 +498,23 @@ pub fn structure_by_name(name: &str) -> Result<StructureInfo> {
         .into_iter()
         .find(|candidate| candidate.id == id)
         .ok_or_else(|| anyhow!("结构注册表中缺少 ID {id}"))
+}
+
+pub fn piece_selector(structure_id: i32, name: &str) -> Result<String> {
+    let normalized = normalize_resource_name(name);
+    let c_name = CString::new(normalized.as_str()).context("子结构名称包含 NUL 字符")?;
+    let valid = unsafe { mcseed_piece_selector_valid(structure_id, c_name.as_ptr()) };
+    if valid == 0 {
+        let structure = structures()?
+            .into_iter()
+            .find(|candidate| candidate.id == structure_id)
+            .map(|candidate| candidate.name)
+            .unwrap_or_else(|| structure_id.to_string());
+        bail!(
+            "结构 {structure} 不支持子结构选择器 {name:?}；运行 `mcseed-finder list pieces` 查看名称"
+        );
+    }
+    Ok(normalized)
 }
 
 pub fn biome_name(id: i32) -> Option<String> {
@@ -369,7 +578,10 @@ fn optional_c_string(pointer: *const c_char) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeContext, biome_by_name, biomes, structure_by_name, structures};
+    use super::{
+        NativeContext, PieceAccuracy, biome_by_name, biomes, piece_selector, pieces,
+        structure_by_name, structures,
+    };
     use crate::domain::Dimension;
 
     #[test]
@@ -393,6 +605,37 @@ mod tests {
     }
 
     #[test]
+    fn piece_registry_exposes_groups_and_exact_templates() {
+        let village = structure_by_name("village").expect("村庄注册项");
+        let shipwreck = structure_by_name("shipwreck").expect("沉船注册项");
+        let entries = pieces().expect("子结构注册表");
+        assert!(entries.len() > 500);
+        assert!(entries.iter().any(|entry| {
+            entry.structure_id == village.id && entry.name == "blacksmith" && entry.is_group
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.structure_id == village.id
+                && entry.name == "village/snowy/houses/snowy_weapon_smith_1"
+                && !entry.is_group
+                && entry.accuracy == PieceAccuracy::ApproximateTerrain
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.structure_id == shipwreck.id
+                && entry.name == "shipwreck/with_mast"
+                && entry.accuracy == PieceAccuracy::Exact
+        }));
+        assert_eq!(
+            piece_selector(village.id, "Blacksmith").expect("分组选择器"),
+            "blacksmith"
+        );
+        assert_eq!(
+            piece_selector(village.id, "Librarian").expect("职业别名"),
+            "librarian"
+        );
+        assert!(piece_selector(village.id, "not_a_house").is_err());
+    }
+
+    #[test]
     fn seed_zero_matches_known_26_2_regression_values() {
         let mut context = NativeContext::new().expect("生成器");
         context.set_seed(0);
@@ -412,6 +655,38 @@ mod tests {
             (
                 village_scan.hits[0].position.x,
                 village_scan.hits[0].position.z
+            ),
+            (272, 944)
+        );
+
+        let blacksmith_scan = context
+            .find_structure_pieces(
+                village.id,
+                &["blacksmith".to_owned()],
+                -32,
+                0,
+                1_024,
+                1,
+                true,
+            )
+            .expect("铁匠铺扫描");
+        assert_eq!(blacksmith_scan.found, 1);
+        assert_eq!(
+            blacksmith_scan.hits[0].name,
+            "village/plains/houses/plains_weaponsmith_1"
+        );
+        assert_eq!(
+            (
+                blacksmith_scan.hits[0].position.x,
+                blacksmith_scan.hits[0].position.y,
+                blacksmith_scan.hits[0].position.z,
+            ),
+            (267, Some(71), 960)
+        );
+        assert_eq!(
+            (
+                blacksmith_scan.hits[0].parent_position.x,
+                blacksmith_scan.hits[0].parent_position.z,
             ),
             (272, 944)
         );

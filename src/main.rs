@@ -52,8 +52,15 @@ fn run() -> Result<bool> {
         }
         Command::List(arguments) => {
             match arguments.kind {
-                ListKind::Biomes => list_biomes(arguments.json)?,
-                ListKind::Structures => list_structures(arguments.json)?,
+                ListKind::Biomes => {
+                    reject_piece_list_filter(arguments.structure.as_deref())?;
+                    list_biomes(arguments.json)?;
+                }
+                ListKind::Structures => {
+                    reject_piece_list_filter(arguments.structure.as_deref())?;
+                    list_structures(arguments.json)?;
+                }
+                ListKind::Pieces => list_pieces(arguments.json, arguments.structure.as_deref())?,
             }
             Ok(true)
         }
@@ -114,6 +121,7 @@ fn load_filter(arguments: &FilterArgs) -> Result<(FileConfig, CompiledFilter)> {
         &arguments.spawn_biome,
         &arguments.biome_near,
         &arguments.structure_near,
+        &arguments.piece_near,
     )?);
     let filter = CompiledFilter::compile(file.conditions.clone())?;
     Ok((file, filter))
@@ -172,6 +180,73 @@ fn list_structures(as_json: bool) -> Result<()> {
             println!(
                 "{:<10} {:<24} {}",
                 entry.dimension,
+                entry.name,
+                entry.accuracy.description()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_piece_list_filter(structure: Option<&str>) -> Result<()> {
+    if structure.is_some() {
+        bail!("--structure 只能与 `list pieces` 一起使用");
+    }
+    Ok(())
+}
+
+fn list_pieces(as_json: bool, structure: Option<&str>) -> Result<()> {
+    let selected_structure = structure.map(native::structure_by_name).transpose()?;
+    let structures = native::structures()?;
+    let mut entries = native::pieces()?;
+    if let Some(parent) = &selected_structure {
+        entries.retain(|entry| entry.structure_id == parent.id);
+    }
+    entries.sort_by(|left, right| {
+        let left_parent = structures
+            .iter()
+            .find(|entry| entry.id == left.structure_id)
+            .map(|entry| entry.name.as_str())
+            .unwrap_or("");
+        let right_parent = structures
+            .iter()
+            .find(|entry| entry.id == right.structure_id)
+            .map(|entry| entry.name.as_str())
+            .unwrap_or("");
+        left_parent
+            .cmp(right_parent)
+            .then_with(|| right.is_group.cmp(&left.is_group))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if as_json {
+        let values = entries
+            .iter()
+            .map(|entry| {
+                let parent = structures
+                    .iter()
+                    .find(|candidate| candidate.id == entry.structure_id)
+                    .map(|candidate| candidate.name.as_str())
+                    .unwrap_or("unknown");
+                json!({
+                    "structure": parent,
+                    "name": entry.name,
+                    "kind": if entry.is_group { "group" } else { "piece" },
+                    "accuracy": entry.accuracy.description(),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else {
+        for entry in entries {
+            let parent = structures
+                .iter()
+                .find(|candidate| candidate.id == entry.structure_id)
+                .map(|candidate| candidate.name.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "{:<20} {:<6} {:<64} {}",
+                parent,
+                if entry.is_group { "group" } else { "piece" },
                 entry.name,
                 entry.accuracy.description()
             );

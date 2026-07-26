@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "mcseed-finder",
     version,
-    about = "Minecraft Java 26.2 种子筛选器",
-    long_about = "按出生生物群系、指定半径内的生物群系、主世界/下界/末地结构等条件搜索 Minecraft Java 26.2 种子。"
+    about = "Minecraft Java 种子筛选器",
+    long_about = "按出生生物群系、指定半径内的生物群系、主世界/下界/末地结构及结构内部部件搜索 Minecraft Java 种子。"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,7 +20,7 @@ pub enum Command {
     Find(FindArgs),
     /// 检查一个种子并输出每个条件的结果
     Check(CheckArgs),
-    /// 列出所有可用的生物群系或结构名称
+    /// 列出可用的生物群系、结构或子部件名称
     List(ListArgs),
 }
 
@@ -101,6 +101,10 @@ pub struct FilterArgs {
     /// STRUCTURE[,STRUCTURE]:RADIUS；维度与锚点自动推断，可重复
     #[arg(long, value_name = "SPEC")]
     pub structure_near: Vec<String>,
+
+    /// STRUCTURE:PIECE[,PIECE]:RADIUS；例如 village:blacksmith:1024，可重复
+    #[arg(long, alias = "substructure-near", value_name = "SPEC")]
+    pub piece_near: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -111,12 +115,17 @@ pub struct ListArgs {
     /// 输出 JSON
     #[arg(long)]
     pub json: bool,
+
+    /// 仅列出指定父结构的子结构；只用于 pieces
+    #[arg(long, value_name = "STRUCTURE")]
+    pub structure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ListKind {
     Biomes,
     Structures,
+    Pieces,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

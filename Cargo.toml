@@ -2,8 +2,9 @@
 name = "mcseed-finder"
 version = "0.1.0"
 edition = "2024"
-description = "Minecraft 26.2 seed finder"
+description = "Fast, multithreaded Minecraft Java seed finder"
 license = "MIT"
+repository = "https://github.com/69gg/MCseedFinder"
 build = "build.rs"
 include = [
     "/Cargo.lock",
@@ -17,6 +18,7 @@ include = [
     "/scripts/**",
     "/src/**",
     "/tests/**",
+    "/tools/*.py",
     "/vendor/cubiomes/**",
 ]
 
