@@ -52,8 +52,18 @@ unsafe extern "C" {
     fn mcseed_context_destroy(context: *mut RawContext);
     fn mcseed_context_set_seed(context: *mut RawContext, seed: c_ulonglong);
     fn mcseed_spawn(context: *mut RawContext, spawn: *mut RawHit, biome_id: *mut c_int) -> c_int;
+    fn mcseed_spawn_from_estimate(
+        context: *mut RawContext,
+        estimate_x: c_int,
+        estimate_z: c_int,
+        spawn: *mut RawHit,
+        biome_id: *mut c_int,
+    ) -> c_int;
     fn mcseed_estimated_spawn(context: *mut RawContext, spawn: *mut RawHit) -> c_int;
+    #[cfg(test)]
+    fn mcseed_estimated_spawn_reference(context: *mut RawContext, spawn: *mut RawHit) -> c_int;
     fn mcseed_spawn_refinement_radius(radius: *mut c_uint) -> c_int;
+    fn mcseed_spawn_origin_radius(radius: *mut c_uint) -> c_int;
 
     fn mcseed_biome_count() -> c_int;
     fn mcseed_biome_name_at(index: c_int) -> *const c_char;
@@ -139,6 +149,16 @@ unsafe extern "C" {
         predicate_count: usize,
         matches: *mut u8,
     );
+    #[cfg(test)]
+    fn mcseed_gpu_reference_pair_filter(
+        candidates: *const GpuCandidate,
+        candidate_count: usize,
+        configs: *const GpuStructureConfig,
+        config_count: usize,
+        predicates: *const GpuPairPredicate,
+        predicate_count: usize,
+        matches: *mut u8,
+    );
 }
 
 #[repr(C)]
@@ -162,6 +182,19 @@ pub(crate) struct GpuPredicate {
     pub anchor_x: i32,
     pub anchor_z: i32,
     pub minimum: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GpuPairPredicate {
+    pub left_config_offset: u32,
+    pub left_config_count: u32,
+    pub right_config_offset: u32,
+    pub right_config_count: u32,
+    pub left_radius: u32,
+    pub right_radius: u32,
+    pub anchor_radius: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
@@ -305,6 +338,29 @@ impl NativeContext {
         })
     }
 
+    pub(crate) fn spawn_from_estimate(&mut self, estimate: Position) -> Result<NativeSpawn> {
+        let mut raw_hit = RawHit::default();
+        let mut biome_id = -1;
+        let status = unsafe {
+            mcseed_spawn_from_estimate(
+                self.raw.as_ptr(),
+                estimate.x,
+                estimate.z,
+                &mut raw_hit,
+                &mut biome_id,
+            )
+        };
+        ensure_status(status, "从估算点细化出生点")?;
+        Ok(NativeSpawn {
+            position: Position {
+                x: raw_hit.x,
+                y: Some(raw_hit.y),
+                z: raw_hit.z,
+            },
+            biome_id,
+        })
+    }
+
     pub fn spawn(&mut self) -> Result<SpawnInfo> {
         self.spawn_raw()?.into_info()
     }
@@ -313,6 +369,18 @@ impl NativeContext {
         let mut raw_hit = RawHit::default();
         let status = unsafe { mcseed_estimated_spawn(self.raw.as_ptr(), &mut raw_hit) };
         ensure_status(status, "估算出生点")?;
+        Ok(Position {
+            x: raw_hit.x,
+            y: None,
+            z: raw_hit.z,
+        })
+    }
+
+    #[cfg(test)]
+    fn estimated_spawn_reference(&mut self) -> Result<Position> {
+        let mut raw_hit = RawHit::default();
+        let status = unsafe { mcseed_estimated_spawn_reference(self.raw.as_ptr(), &mut raw_hit) };
+        ensure_status(status, "使用参考算法估算出生点")?;
         Ok(Position {
             x: raw_hit.x,
             y: None,
@@ -629,6 +697,15 @@ pub(crate) fn spawn_refinement_radius() -> Result<Option<u32>> {
     }
 }
 
+pub(crate) fn spawn_origin_radius() -> Result<Option<u32>> {
+    let mut radius = 0;
+    match unsafe { mcseed_spawn_origin_radius(&mut radius) } {
+        1 => Ok(Some(radius)),
+        0 => Ok(None),
+        status => bail!("读取出生点原点半径失败（错误码 {status}）"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn gpu_reference_filter(
     candidates: &[GpuCandidate],
@@ -638,6 +715,27 @@ pub(crate) fn gpu_reference_filter(
     let mut matches = vec![0; candidates.len()];
     unsafe {
         mcseed_gpu_reference_filter(
+            candidates.as_ptr(),
+            candidates.len(),
+            configs.as_ptr(),
+            configs.len(),
+            predicates.as_ptr(),
+            predicates.len(),
+            matches.as_mut_ptr(),
+        )
+    };
+    matches
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_reference_pair_filter(
+    candidates: &[GpuCandidate],
+    configs: &[GpuStructureConfig],
+    predicates: &[GpuPairPredicate],
+) -> Vec<u8> {
+    let mut matches = vec![0; candidates.len()];
+    unsafe {
+        mcseed_gpu_reference_pair_filter(
             candidates.as_ptr(),
             candidates.len(),
             configs.as_ptr(),
@@ -729,9 +827,9 @@ fn optional_c_string(pointer: *const c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuCandidate, GpuPredicate, GpuStructureConfig, NativeContext, PieceAccuracy,
-        biome_by_name, biomes, piece_selector, pieces, spawn_refinement_radius, structure_by_name,
-        structures,
+        GpuCandidate, GpuPairPredicate, GpuPredicate, GpuStructureConfig, NativeContext,
+        PieceAccuracy, biome_by_name, biomes, piece_selector, pieces, spawn_origin_radius,
+        spawn_refinement_radius, structure_by_name, structures,
     };
     use crate::domain::Dimension;
 
@@ -751,6 +849,7 @@ mod tests {
     fn gpu_ffi_layout_matches_the_native_abi() {
         assert_eq!(std::mem::size_of::<GpuStructureConfig>(), 24);
         assert_eq!(std::mem::size_of::<GpuPredicate>(), 32);
+        assert_eq!(std::mem::size_of::<GpuPairPredicate>(), 32);
         assert_eq!(std::mem::size_of::<GpuCandidate>(), 16);
     }
 
@@ -762,16 +861,81 @@ mod tests {
         assert_eq!(radius, 125);
         let radius_squared = u64::from(radius) * u64::from(radius);
         let mut context = NativeContext::new().expect("生成器");
+        let mut direct_context = NativeContext::new().expect("直接出生点生成器");
+        let mut supplied_context = NativeContext::new().expect("外部估算点生成器");
         for seed in -16_i64..16 {
             context.set_seed(seed);
+            let reference = context
+                .estimated_spawn_reference()
+                .expect("参考算法估计出生点");
             let estimated = context.estimated_spawn().expect("估计出生点");
+            assert_eq!(
+                estimated, reference,
+                "seed {seed} 的优化出生点估算与参考算法不一致"
+            );
             let final_spawn = context.spawn_raw().expect("最终出生点");
+            direct_context.set_seed(seed);
+            let direct_spawn = direct_context.spawn_raw().expect("直接计算最终出生点");
+            supplied_context.set_seed(seed);
+            let supplied_spawn = supplied_context
+                .spawn_from_estimate(estimated)
+                .expect("从外部估算点细化出生点");
+            assert_eq!(
+                final_spawn.position, direct_spawn.position,
+                "seed {seed} 复用估计点后改变了最终出生位置"
+            );
+            assert_eq!(
+                final_spawn.biome_id, direct_spawn.biome_id,
+                "seed {seed} 复用估计点后改变了出生生物群系"
+            );
+            assert_eq!(
+                supplied_spawn.position, direct_spawn.position,
+                "seed {seed} 从外部估算点细化后改变了最终出生位置"
+            );
+            assert_eq!(
+                supplied_spawn.biome_id, direct_spawn.biome_id,
+                "seed {seed} 从外部估算点细化后改变了出生生物群系"
+            );
             let dx = i64::from(final_spawn.position.x) - i64::from(estimated.x);
             let dz = i64::from(final_spawn.position.z) - i64::from(estimated.z);
             assert!(
                 (dx * dx + dz * dz) as u64 <= radius_squared,
                 "seed {seed} 的出生点细化超出严格边界"
             );
+        }
+    }
+
+    #[test]
+    fn origin_bound_contains_the_final_spawn() {
+        let radius = spawn_origin_radius()
+            .expect("出生点原点边界能力")
+            .expect("当前版本应提供严格原点边界");
+        assert_eq!(radius, 2_697);
+        let radius_squared = u64::from(radius) * u64::from(radius);
+        let mut context = NativeContext::new().expect("生成器");
+        for seed in -32_i64..32 {
+            context.set_seed(seed);
+            let spawn = context.spawn_raw().expect("最终出生点");
+            let x = i64::from(spawn.position.x);
+            let z = i64::from(spawn.position.z);
+            assert!(
+                (x * x + z * z) as u64 <= radius_squared,
+                "seed {seed} 的最终出生点超出严格原点边界"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "有限规模性能与正确性验证；不纳入日常测试"]
+    fn optimized_spawn_estimate_matches_reference_for_ten_thousand_seeds() {
+        let mut context = NativeContext::new().expect("生成器");
+        for seed in 0_i64..10_000 {
+            context.set_seed(seed);
+            let reference = context
+                .estimated_spawn_reference()
+                .expect("参考算法估计出生点");
+            let optimized = context.estimated_spawn().expect("优化算法估计出生点");
+            assert_eq!(optimized, reference, "seed {seed} 的出生点估算不一致");
         }
     }
 

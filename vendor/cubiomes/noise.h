@@ -78,6 +78,7 @@ int xDoublePerlinInit(DoublePerlinNoise *noise, Xoroshiro *xr,
 
 double sampleDoublePerlin(const DoublePerlinNoise *noise,
         double x, double y, double z);
+double sampleDoublePerlin2D(const DoublePerlinNoise *noise, double x, double z);
 
 
 #ifdef __cplusplus
@@ -85,6 +86,5 @@ double sampleDoublePerlin(const DoublePerlinNoise *noise,
 #endif
 
 #endif /* NOISE_H_ */
-
 
 

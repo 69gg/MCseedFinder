@@ -527,6 +527,22 @@ double sampleOctave(const OctaveNoise *noise, double x, double y, double z)
     return v;
 }
 
+double sampleOctave2D(const OctaveNoise *noise, double x, double z)
+{
+    double v = 0;
+    int i;
+    for (i = 0; i < noise->octcnt; i++)
+    {
+        PerlinNoise *p = noise->octaves + i;
+        double lf = p->lacunarity;
+        double ax = maintainPrecision(x * lf);
+        double az = maintainPrecision(z * lf);
+        double pv = samplePerlin(p, ax, 0, az, 0, 0);
+        v += p->amplitude * pv;
+    }
+    return v;
+}
+
 double sampleOctaveBeta17Biome(const OctaveNoise *noise, double x, double z)
 {
     double v = 0;
@@ -618,3 +634,10 @@ double sampleDoublePerlin(const DoublePerlinNoise *noise,
     return v * noise->amplitude;
 }
 
+double sampleDoublePerlin2D(const DoublePerlinNoise *noise, double x, double z)
+{
+    const double f = 337.0 / 331.0;
+    double v = sampleOctave2D(&noise->octA, x, z);
+    v += sampleOctave2D(&noise->octB, x*f, z*f);
+    return v * noise->amplitude;
+}

@@ -463,6 +463,14 @@ fn compiled_gpu_search_matches_cpu_on_a_small_fixed_range_when_available() {
     cpu_arguments.extend(["--accelerator", "cpu"]);
     let mut gpu_arguments = common.to_vec();
     gpu_arguments.extend(["--accelerator", backend]);
+    let mut gpu_single_thread_arguments = common.to_vec();
+    let thread_count = gpu_single_thread_arguments
+        .iter_mut()
+        .skip_while(|argument| **argument != "--threads")
+        .nth(1)
+        .expect("测试参数应包含线程数");
+    *thread_count = "1";
+    gpu_single_thread_arguments.extend(["--accelerator", backend]);
     let cpu = run(&cpu_arguments);
     let gpu = run(&gpu_arguments);
     if gpu.status.code() == Some(2) {
@@ -481,6 +489,13 @@ fn compiled_gpu_search_matches_cpu_on_a_small_fixed_range_when_available() {
         String::from_utf8_lossy(&gpu.stderr)
     );
     assert_eq!(json_lines(&gpu), json_lines(&cpu));
+    let gpu_single_thread = run(&gpu_single_thread_arguments);
+    assert!(
+        gpu_single_thread.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gpu_single_thread.stderr)
+    );
+    assert_eq!(json_lines(&gpu_single_thread), json_lines(&gpu));
     let gpu_stderr = String::from_utf8_lossy(&gpu.stderr);
     assert!(gpu_stderr.contains(&format!("搜索后端：{backend}:")));
     assert!(gpu_stderr.contains("GPU 出生点粗筛："));

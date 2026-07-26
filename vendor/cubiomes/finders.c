@@ -1162,70 +1162,363 @@ int nextStronghold(StrongholdIter *sh, const Generator *g)
 }
 
 
-static
-uint64_t calcFitness(const Generator *g, int x, int z)
+static const int64_t g_spawn_np[][2] = {
+    {-10000,10000},{-10000,10000},{-1100,10000},{-10000,10000},{0,0},
+    {-10000,-1600},{1600,10000} // [6]: weirdness for the second noise point
+};
+
+static inline
+uint64_t spawnParameterDistance(int64_t value, const int64_t range[2])
 {
-    int64_t np[6];
-    uint32_t flags = SAMPLE_NO_DEPTH | SAMPLE_NO_BIOME;
-    sampleBiomeNoise(&g->bn, np, x>>2, 0, z>>2, NULL, flags);
-    const int64_t spawn_np[][2] = {
-        {-10000,10000},{-10000,10000},{-1100,10000},{-10000,10000},{0,0},
-        {-10000,-1600},{1600,10000} // [6]: weirdness for the second noise point
-    };
-    uint64_t ds = 0, ds1 = 0, ds2 = 0;
-    uint64_t a, b, q, i;
-    for (i = 0; i < 5; i++)
-    {
-        a = +np[i] - (uint64_t)spawn_np[i][1];
-        b = -np[i] + (uint64_t)spawn_np[i][0];
-        q = (int64_t)a > 0 ? a : (int64_t)b > 0 ? b : 0;
-        ds += q * q;
-    }
-    a = +np[5] - (uint64_t)spawn_np[5][1];
-    b = -np[5] + (uint64_t)spawn_np[5][0];
-    q = (int64_t)a > 0 ? a : (int64_t)b > 0 ? b : 0;
-    ds1 = ds + q*q;
-    a = +np[5] - (uint64_t)spawn_np[6][1];
-    b = -np[5] + (uint64_t)spawn_np[6][0];
-    q = (int64_t)a > 0 ? a : (int64_t)b > 0 ? b : 0;
-    ds2 = ds + q*q;
-    ds = ds1 <= ds2 ? ds1 : ds2;
-    // apply dependence on distance from origin
-    a = (int64_t)x*x;
-    b = (int64_t)z*z;
+    if (value > range[1])
+        return (uint64_t)(value - range[1]);
+    if (value < range[0])
+        return (uint64_t)(range[0] - value);
+    return 0;
+}
+
+static inline
+uint64_t applySpawnOriginBias(const Generator *g, uint64_t distance, int x, int z)
+{
+    uint64_t x2 = (uint64_t)((int64_t)x*x);
+    uint64_t z2 = (uint64_t)((int64_t)z*z);
     if (g->mc <= MC_1_21_1)
     {
-        double s = (double)(a + b) / (2500 * 2500);
-        q = (uint64_t)(s*s * 1e8) + ds;
+        double s = (double)(x2 + z2) / (2500 * 2500);
+        return (uint64_t)(s*s * 1e8) + distance;
     }
-    else
-    {
-        q = ds * (2048LL * 2048LL) + a + b;
-    }
-    return q;
+    return distance * (2048LL * 2048LL) + x2 + z2;
+}
+
+typedef struct SpawnFitnessNoise {
+    double shifted_x;
+    double shifted_z;
+    int64_t continentalness;
+    int64_t weirdness;
+} SpawnFitnessNoise;
+
+static
+void sampleSpawnFitnessShift(
+    const Generator *g, int x, int z, SpawnFitnessNoise *sample
+)
+{
+    sample->shifted_x = x + sampleDoublePerlin2D(
+        &g->bn.climate[NP_SHIFT], x, z
+    ) * 4.0;
+    sample->shifted_z = z + sampleDoublePerlin(
+        &g->bn.climate[NP_SHIFT], z, x, 0
+    ) * 4.0;
 }
 
 static
-void findFittest(const Generator *g, Pos *pos, uint64_t *fitness, double maxrad, double step)
+void sampleSpawnFitnessWeirdness(
+    const Generator *g, SpawnFitnessNoise *sample
+)
 {
-    double rad, ang;
-    Pos p = *pos;
-    for (rad = step; rad <= maxrad; rad += step)
+    float weirdness = sampleDoublePerlin2D(
+        &g->bn.climate[NP_WEIRDNESS],
+        sample->shifted_x, sample->shifted_z
+    );
+    sample->weirdness = (int64_t)(10000.0F * weirdness);
+}
+
+static
+void sampleSpawnFitnessContinentalness(
+    const Generator *g, SpawnFitnessNoise *sample
+)
+{
+    float continentalness = sampleDoublePerlin2D(
+        &g->bn.climate[NP_CONTINENTALNESS],
+        sample->shifted_x, sample->shifted_z
+    );
+    sample->continentalness = (int64_t)(10000.0F * continentalness);
+}
+
+static
+uint64_t calcFitnessFromNoise(
+    const Generator *g, int x, int z, const SpawnFitnessNoise *sample
+)
+{
+    int64_t np[6];
+    uint64_t distance = 0;
+    uint64_t weirdness_distance_a;
+    uint64_t weirdness_distance_b;
+    int i;
+    float erosion = sampleDoublePerlin2D(
+        &g->bn.climate[NP_EROSION],
+        sample->shifted_x, sample->shifted_z
+    );
+    float temperature = sampleDoublePerlin2D(
+        &g->bn.climate[NP_TEMPERATURE],
+        sample->shifted_x, sample->shifted_z
+    );
+    float humidity = sampleDoublePerlin2D(
+        &g->bn.climate[NP_HUMIDITY],
+        sample->shifted_x, sample->shifted_z
+    );
+    np[0] = (int64_t)(10000.0F * temperature);
+    np[1] = (int64_t)(10000.0F * humidity);
+    np[2] = sample->continentalness;
+    np[3] = (int64_t)(10000.0F * erosion);
+    np[4] = 0;
+    np[5] = sample->weirdness;
+    for (i = 0; i < 5; i++)
     {
-        for (ang = 0; ang <= PI*2; ang += step/rad)
+        uint64_t delta = spawnParameterDistance(np[i], g_spawn_np[i]);
+        distance += delta * delta;
+    }
+    weirdness_distance_a = spawnParameterDistance(np[5], g_spawn_np[5]);
+    weirdness_distance_b = spawnParameterDistance(np[5], g_spawn_np[6]);
+    weirdness_distance_a *= weirdness_distance_a;
+    weirdness_distance_b *= weirdness_distance_b;
+    distance += MIN(weirdness_distance_a, weirdness_distance_b);
+    return applySpawnOriginBias(g, distance, x, z);
+}
+
+static
+uint64_t calcFitness(const Generator *g, int x, int z)
+{
+    SpawnFitnessNoise sample;
+    sampleSpawnFitnessShift(g, x>>2, z>>2, &sample);
+    sampleSpawnFitnessWeirdness(g, &sample);
+    sampleSpawnFitnessContinentalness(g, &sample);
+    return calcFitnessFromNoise(g, x, z, &sample);
+}
+
+static
+uint64_t calcFitnessReference(const Generator *g, int x, int z)
+{
+    int64_t np[6];
+    uint32_t flags = SAMPLE_NO_DEPTH | SAMPLE_NO_BIOME;
+    uint64_t distance = 0;
+    uint64_t weirdness_distance_a;
+    uint64_t weirdness_distance_b;
+    int i;
+    sampleBiomeNoise(&g->bn, np, x>>2, 0, z>>2, NULL, flags);
+    for (i = 0; i < 5; i++)
+    {
+        uint64_t delta = spawnParameterDistance(np[i], g_spawn_np[i]);
+        distance += delta * delta;
+    }
+    weirdness_distance_a = spawnParameterDistance(np[5], g_spawn_np[5]);
+    weirdness_distance_b = spawnParameterDistance(np[5], g_spawn_np[6]);
+    weirdness_distance_a *= weirdness_distance_a;
+    weirdness_distance_b *= weirdness_distance_b;
+    distance += MIN(weirdness_distance_a, weirdness_distance_b);
+    return applySpawnOriginBias(g, distance, x, z);
+}
+
+static
+uint64_t calcFitnessWeirdnessLowerBound(
+    const Generator *g, int x, int z, const SpawnFitnessNoise *sample
+)
+{
+    uint64_t distance_a = spawnParameterDistance(
+        sample->weirdness, g_spawn_np[5]
+    );
+    uint64_t distance_b = spawnParameterDistance(
+        sample->weirdness, g_spawn_np[6]
+    );
+    distance_a *= distance_a;
+    distance_b *= distance_b;
+    return applySpawnOriginBias(g, MIN(distance_a, distance_b), x, z);
+}
+
+static
+uint64_t calcFitnessLowerBoundFromNoise(
+    const Generator *g, int x, int z, const SpawnFitnessNoise *sample
+)
+{
+    uint64_t continentalness_distance;
+    uint64_t weirdness_distance_a;
+    uint64_t weirdness_distance_b;
+    uint64_t distance;
+    continentalness_distance = spawnParameterDistance(
+        sample->continentalness, g_spawn_np[2]
+    );
+    weirdness_distance_a = spawnParameterDistance(
+        sample->weirdness, g_spawn_np[5]
+    );
+    weirdness_distance_b = spawnParameterDistance(
+        sample->weirdness, g_spawn_np[6]
+    );
+    distance = continentalness_distance * continentalness_distance;
+    weirdness_distance_a *= weirdness_distance_a;
+    weirdness_distance_b *= weirdness_distance_b;
+    distance += MIN(weirdness_distance_a, weirdness_distance_b);
+    return applySpawnOriginBias(g, distance, x, z);
+}
+
+static
+void findFittestReference(
+    const Generator *g, Pos *pos, uint64_t *fitness, float maxrad, float step
+)
+{
+    float radius = step;
+    float angle = 0.0F;
+    Pos p = *pos;
+    while (radius <= maxrad)
+    {
+        int x = p.x + (int)(sin((double)angle) * radius);
+        int z = p.z + (int)(cos((double)angle) * radius);
+        uint64_t fit = calcFitnessReference(g, x, z);
+        if (fit < *fitness)
         {
-            int x = p.x + (int)(sin(ang) * rad);
-            int z = p.z + (int)(cos(ang) * rad);
-            uint64_t fit = calcFitness(g, x, z);
-            // Then update pos and fitness if combined total is lower/better
-            if (fit < *fitness)
-            {
-                pos->x = x;
-                pos->z = z;
-                *fitness = fit;
-            }
+            pos->x = x;
+            pos->z = z;
+            *fitness = fit;
+        }
+        angle += step / radius;
+        if (angle > PI*2)
+        {
+            angle = 0.0F;
+            radius += step;
         }
     }
+}
+
+enum {
+    SPAWN_FITNESS_CANDIDATE_CAPACITY = 1024,
+    SPAWN_SEARCH_OUTER_RADIUS = 2048,
+    SPAWN_SEARCH_OUTER_STEP = 512,
+    SPAWN_SEARCH_INNER_RADIUS = 512,
+    SPAWN_SEARCH_INNER_STEP = 32,
+    /* Chunk centring changes either axis by at most eight blocks. */
+    SPAWN_CHUNK_CENTER_HORIZONTAL_BOUND = 12,
+};
+
+typedef struct SpawnSearchOffset {
+    int x;
+    int z;
+} SpawnSearchOffset;
+
+struct SpawnSearchWorkspace {
+    SpawnSearchOffset outer_offsets[SPAWN_FITNESS_CANDIDATE_CAPACITY];
+    SpawnSearchOffset inner_offsets[SPAWN_FITNESS_CANDIDATE_CAPACITY];
+    size_t outer_count;
+    size_t inner_count;
+};
+
+static
+size_t buildSpawnSearchOffsets(
+    SpawnSearchOffset *offsets, float maxrad, float step
+)
+{
+    size_t count = 0;
+    float radius = step;
+    float angle = 0.0F;
+    while (radius <= maxrad)
+    {
+        if (count == SPAWN_FITNESS_CANDIDATE_CAPACITY)
+            return 0;
+        offsets[count].x = (int)(sin((double)angle) * radius);
+        offsets[count].z = (int)(cos((double)angle) * radius);
+        count++;
+        angle += step / radius;
+        if (angle > PI*2)
+        {
+            angle = 0.0F;
+            radius += step;
+        }
+    }
+    return count;
+}
+
+SpawnSearchWorkspace *createSpawnSearchWorkspace(void)
+{
+    SpawnSearchWorkspace *workspace = calloc(1, sizeof(*workspace));
+    if (!workspace)
+        return NULL;
+    workspace->outer_count = buildSpawnSearchOffsets(
+        workspace->outer_offsets,
+        SPAWN_SEARCH_OUTER_RADIUS,
+        SPAWN_SEARCH_OUTER_STEP
+    );
+    workspace->inner_count = buildSpawnSearchOffsets(
+        workspace->inner_offsets,
+        SPAWN_SEARCH_INNER_RADIUS,
+        SPAWN_SEARCH_INNER_STEP
+    );
+    if (!workspace->outer_count || !workspace->inner_count)
+    {
+        free(workspace);
+        return NULL;
+    }
+    return workspace;
+}
+
+void freeSpawnSearchWorkspace(SpawnSearchWorkspace *workspace)
+{
+    free(workspace);
+}
+
+static
+void findFittestPrepared(
+    const Generator *g,
+    Pos *pos,
+    uint64_t *fitness,
+    const SpawnSearchOffset *offsets,
+    size_t candidate_count
+)
+{
+    Pos origin = *pos;
+    size_t index;
+
+    for (index = 0; index < candidate_count; index++)
+    {
+        int x = origin.x + offsets[index].x;
+        int z = origin.z + offsets[index].z;
+        uint64_t lower_bound = applySpawnOriginBias(g, 0, x, z);
+        uint64_t fit;
+        SpawnFitnessNoise sample;
+        if (lower_bound >= *fitness)
+            continue;
+        sampleSpawnFitnessShift(g, x>>2, z>>2, &sample);
+        sampleSpawnFitnessWeirdness(g, &sample);
+        lower_bound = calcFitnessWeirdnessLowerBound(g, x, z, &sample);
+        if (lower_bound >= *fitness)
+            continue;
+        sampleSpawnFitnessContinentalness(g, &sample);
+        lower_bound = calcFitnessLowerBoundFromNoise(g, x, z, &sample);
+        if (lower_bound >= *fitness)
+            continue;
+        fit = calcFitnessFromNoise(g, x, z, &sample);
+        if (fit < *fitness)
+        {
+            pos->x = x;
+            pos->z = z;
+            *fitness = fit;
+        }
+    }
+}
+
+static
+void findFittest(const Generator *g, Pos *pos, uint64_t *fitness, float maxrad, float step)
+{
+    SpawnSearchOffset offsets[SPAWN_FITNESS_CANDIDATE_CAPACITY];
+    size_t candidate_count = buildSpawnSearchOffsets(offsets, maxrad, step);
+    if (!candidate_count)
+    {
+        findFittestReference(g, pos, fitness, maxrad, step);
+        return;
+    }
+    findFittestPrepared(g, pos, fitness, offsets, candidate_count);
+}
+
+static
+Pos findFittestPosReference(const Generator *g)
+{
+    Pos spawn = {0, 0};
+    uint64_t fitness = calcFitnessReference(g, 0, 0);
+    findFittestReference(
+        g, &spawn, &fitness, SPAWN_SEARCH_OUTER_RADIUS, SPAWN_SEARCH_OUTER_STEP
+    );
+    findFittestReference(
+        g, &spawn, &fitness, SPAWN_SEARCH_INNER_RADIUS, SPAWN_SEARCH_INNER_STEP
+    );
+    spawn.x = (spawn.x & ~15) + 8;
+    spawn.z = (spawn.z & ~15) + 8;
+    return spawn;
 }
 
 static
@@ -1233,9 +1526,33 @@ Pos findFittestPos(const Generator *g)
 {
     Pos spawn = {0, 0};
     uint64_t fitness = calcFitness(g, 0, 0);
-    findFittest(g, &spawn, &fitness, 2048.0, 512.0);
-    findFittest(g, &spawn, &fitness, 512.0, 32.0);
+    findFittest(
+        g, &spawn, &fitness, SPAWN_SEARCH_OUTER_RADIUS, SPAWN_SEARCH_OUTER_STEP
+    );
+    findFittest(
+        g, &spawn, &fitness, SPAWN_SEARCH_INNER_RADIUS, SPAWN_SEARCH_INNER_STEP
+    );
     // center of chunk
+    spawn.x = (spawn.x & ~15) + 8;
+    spawn.z = (spawn.z & ~15) + 8;
+    return spawn;
+}
+
+static
+Pos findFittestPosWithWorkspace(
+    const Generator *g, SpawnSearchWorkspace *workspace
+)
+{
+    Pos spawn = {0, 0};
+    uint64_t fitness = calcFitness(g, 0, 0);
+    findFittestPrepared(
+        g, &spawn, &fitness, workspace->outer_offsets,
+        workspace->outer_count
+    );
+    findFittestPrepared(
+        g, &spawn, &fitness, workspace->inner_offsets,
+        workspace->inner_count
+    );
     spawn.x = (spawn.x & ~15) + 8;
     spawn.z = (spawn.z & ~15) + 8;
     return spawn;
@@ -1283,10 +1600,39 @@ Pos estimateSpawn(const Generator *g, uint64_t *rng)
     return spawn;
 }
 
-Pos getSpawn(const Generator *g)
+Pos estimateSpawnWithWorkspace(
+    const Generator *g, uint64_t *rng, SpawnSearchWorkspace *workspace
+)
 {
-    uint64_t rng;
-    Pos spawn = estimateSpawn(g, &rng);
+    if (!workspace || g->mc < MC_1_18)
+        return estimateSpawn(g, rng);
+    if (rng)
+        *rng = 0;
+    return findFittestPosWithWorkspace(g, workspace);
+}
+
+Pos estimateSpawnReference(const Generator *g, uint64_t *rng)
+{
+    if (g->mc < MC_1_18)
+        return estimateSpawn(g, rng);
+    if (rng)
+        *rng = 0;
+    return findFittestPosReference(g);
+}
+
+int getSpawnEstimateOriginRadius(int mc)
+{
+    if (mc < MC_1_18)
+        return 0;
+    /* The first pass stays within 2048 blocks of the origin, the second within
+     * 512 blocks of that winner, and chunk centring adds at most sqrt(2*8^2).
+     */
+    return SPAWN_SEARCH_OUTER_RADIUS + SPAWN_SEARCH_INNER_RADIUS +
+        SPAWN_CHUNK_CENTER_HORIZONTAL_BOUND;
+}
+
+Pos getSpawnForEstimate(const Generator *g, Pos spawn, uint64_t rng)
+{
     int i, j, k, u, v, cx0, cz0;
     uint32_t ii, jj;
 
@@ -1396,6 +1742,13 @@ Pos getSpawn(const Generator *g)
     }
 
     return spawn;
+}
+
+Pos getSpawn(const Generator *g)
+{
+    uint64_t rng = 0;
+    Pos spawn = estimateSpawn(g, &rng);
+    return getSpawnForEstimate(g, spawn, rng);
 }
 
 //==============================================================================
@@ -3401,6 +3754,7 @@ int isViableStructureTerrain(int structType, Generator *g, int x, int z)
     g->bn.nptype = nptype;
     return ret;
 }
+
 
 
 /* Given bordering noise columns and a fractional position between those,
@@ -7919,5 +8273,3 @@ int getLargestRec(int match, const int *ids, int sx, int sz, Pos *p0, Pos *p1)
     free(meta);
     return ret;
 }
-
-

@@ -202,6 +202,7 @@ static void assert_village_centers_match_cubiomes_variant(void)
 int main(void)
 {
     McSeedContext *context;
+    McSeedContext *direct_spawn_context;
     McSeedHit spawn;
     McSeedHit hits[8];
     McSeedPieceHit piece_hits[8];
@@ -214,6 +215,7 @@ int main(void)
     int32_t limit_reached;
     uint64_t found;
     uint32_t spawn_refinement_radius;
+    uint32_t spawn_origin_radius;
 
     assert_gpu_placements_match_cubiomes();
     assert_village_centers_match_cubiomes_variant();
@@ -242,16 +244,48 @@ int main(void)
 
     {
         McSeedHit estimated;
+        McSeedHit reference_estimated;
+        McSeedHit direct_spawn;
+        McSeedHit supplied_spawn;
+        int32_t direct_biome_id;
+        int32_t supplied_biome_id;
         int64_t dx;
         int64_t dz;
+        assert(mcseed_estimated_spawn_reference(context, &reference_estimated) == 0);
         assert(mcseed_estimated_spawn(context, &estimated) == 0);
+        assert(estimated.x == reference_estimated.x &&
+            estimated.z == reference_estimated.z);
         assert(mcseed_spawn_refinement_radius(&spawn_refinement_radius) == 1);
         assert(spawn_refinement_radius == 125);
+        assert(mcseed_spawn_origin_radius(&spawn_origin_radius) == 1);
+        assert(spawn_origin_radius == 2697);
         assert(mcseed_spawn(context, &spawn, &biome_id) == 0);
         dx = (int64_t)spawn.x - estimated.x;
         dz = (int64_t)spawn.z - estimated.z;
         assert(dx * dx + dz * dz <=
             (int64_t)spawn_refinement_radius * spawn_refinement_radius);
+
+        direct_spawn_context = mcseed_context_create();
+        assert(direct_spawn_context != NULL);
+        mcseed_context_set_seed(direct_spawn_context, 0);
+        assert(mcseed_spawn(
+            direct_spawn_context,
+            &direct_spawn,
+            &direct_biome_id
+        ) == 0);
+        assert(direct_spawn.x == spawn.x && direct_spawn.y == spawn.y &&
+            direct_spawn.z == spawn.z && direct_biome_id == biome_id);
+        mcseed_context_set_seed(direct_spawn_context, 0);
+        assert(mcseed_spawn_from_estimate(
+            direct_spawn_context,
+            estimated.x,
+            estimated.z,
+            &supplied_spawn,
+            &supplied_biome_id
+        ) == 0);
+        assert(supplied_spawn.x == spawn.x && supplied_spawn.y == spawn.y &&
+            supplied_spawn.z == spawn.z && supplied_biome_id == biome_id);
+        mcseed_context_destroy(direct_spawn_context);
     }
 
     assert(spawn.x == -32 && spawn.y == 65 && spawn.z == 0);
@@ -267,6 +301,15 @@ int main(void)
             &candidate, 1, &config, 1, &predicate, 1, &placement_match
         );
         assert(placement_match == 1);
+
+        {
+            McSeedGpuPairPredicate pair = {0, 1, 0, 1, 1024, 1024, 2697, 0};
+            placement_match = 0;
+            mcseed_gpu_reference_pair_filter(
+                &candidate, 1, &config, 1, &pair, 1, &placement_match
+            );
+            assert(placement_match == 1);
+        }
     }
 
     assert(mcseed_find_biomes(

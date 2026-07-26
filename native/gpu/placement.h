@@ -319,6 +319,150 @@ MCSEED_GPU_INLINE int mcseed_gpu_predicate_matches(
     return 0;
 }
 
+MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
+    const McSeedGpuCandidate *candidate,
+    const McSeedGpuStructureConfig *configs,
+    const McSeedGpuPairPredicate *predicate
+)
+{
+    uint64_t left_envelope_u64 = (uint64_t)predicate->anchor_radius +
+        predicate->left_radius;
+    uint64_t right_envelope_u64 = (uint64_t)predicate->anchor_radius +
+        predicate->right_radius;
+    uint64_t pair_radius_u64 = (uint64_t)predicate->left_radius +
+        predicate->right_radius;
+    uint32_t left_envelope;
+    uint32_t right_envelope;
+    uint32_t pair_radius;
+    uint32_t left_config_index;
+    McSeedGpuPosition origin = {0, 0};
+
+    if (left_envelope_u64 > UINT32_MAX || right_envelope_u64 > UINT32_MAX ||
+        pair_radius_u64 > UINT32_MAX)
+        return 1;
+    left_envelope = (uint32_t)left_envelope_u64;
+    right_envelope = (uint32_t)right_envelope_u64;
+    pair_radius = (uint32_t)pair_radius_u64;
+
+    for (left_config_index = 0;
+         left_config_index < predicate->left_config_count;
+         left_config_index++) {
+        const McSeedGpuStructureConfig *left_config =
+            &configs[predicate->left_config_offset + left_config_index];
+        int64_t left_span = (int64_t)left_config->region_size * 16;
+        int64_t left_region_min = mcseed_gpu_floor_div_i64(
+            -(int64_t)left_envelope, left_span
+        ) - 1;
+        int64_t left_region_max = mcseed_gpu_floor_div_i64(
+            (int64_t)left_envelope, left_span
+        ) + 1;
+        int64_t left_region_z;
+
+        for (left_region_z = left_region_min;
+             left_region_z <= left_region_max;
+             left_region_z++) {
+            int64_t left_region_x;
+            if (left_region_z < INT32_MIN || left_region_z > INT32_MAX)
+                continue;
+            for (left_region_x = left_region_min;
+                 left_region_x <= left_region_max;
+                 left_region_x++) {
+                McSeedGpuPosition left_position;
+                uint32_t right_config_index;
+                if (left_region_x < INT32_MIN || left_region_x > INT32_MAX)
+                    continue;
+                if (!mcseed_gpu_position_for_region(
+                        left_config,
+                        candidate->seed,
+                        (int32_t)left_region_x,
+                        (int32_t)left_region_z,
+                        &left_position
+                    ) ||
+                    !mcseed_gpu_within_radius(
+                        left_position, origin.x, origin.z, left_envelope
+                    ))
+                    continue;
+
+                for (right_config_index = 0;
+                     right_config_index < predicate->right_config_count;
+                     right_config_index++) {
+                    const McSeedGpuStructureConfig *right_config =
+                        &configs[predicate->right_config_offset + right_config_index];
+                    int64_t right_span = (int64_t)right_config->region_size * 16;
+                    int64_t right_region_x_min = mcseed_gpu_floor_div_i64(
+                        (int64_t)left_position.x - pair_radius, right_span
+                    ) - 1;
+                    int64_t right_region_x_max = mcseed_gpu_floor_div_i64(
+                        (int64_t)left_position.x + pair_radius, right_span
+                    ) + 1;
+                    int64_t right_region_z_min = mcseed_gpu_floor_div_i64(
+                        (int64_t)left_position.z - pair_radius, right_span
+                    ) - 1;
+                    int64_t right_region_z_max = mcseed_gpu_floor_div_i64(
+                        (int64_t)left_position.z + pair_radius, right_span
+                    ) + 1;
+                    int64_t right_region_z;
+
+                    for (right_region_z = right_region_z_min;
+                         right_region_z <= right_region_z_max;
+                         right_region_z++) {
+                        int64_t right_region_x;
+                        if (right_region_z < INT32_MIN || right_region_z > INT32_MAX)
+                            continue;
+                        for (right_region_x = right_region_x_min;
+                             right_region_x <= right_region_x_max;
+                             right_region_x++) {
+                            McSeedGpuPosition right_position;
+                            if (right_region_x < INT32_MIN ||
+                                right_region_x > INT32_MAX)
+                                continue;
+                            if (!mcseed_gpu_position_for_region(
+                                    right_config,
+                                    candidate->seed,
+                                    (int32_t)right_region_x,
+                                    (int32_t)right_region_z,
+                                    &right_position
+                                ) ||
+                                !mcseed_gpu_within_radius(
+                                    right_position,
+                                    origin.x,
+                                    origin.z,
+                                    right_envelope
+                                ) ||
+                                !mcseed_gpu_within_radius(
+                                    right_position,
+                                    left_position.x,
+                                    left_position.z,
+                                    pair_radius
+                                ))
+                                continue;
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+MCSEED_GPU_INLINE int mcseed_gpu_candidate_matches_pairs(
+    const McSeedGpuCandidate *candidate,
+    const McSeedGpuStructureConfig *configs,
+    const McSeedGpuPairPredicate *predicates,
+    size_t predicate_count
+)
+{
+    size_t index;
+    for (index = 0; index < predicate_count; index++) {
+        if (!mcseed_gpu_pair_predicate_matches(
+                candidate, configs, &predicates[index]
+            ))
+            return 0;
+    }
+    return 1;
+}
+
 MCSEED_GPU_INLINE int mcseed_gpu_candidate_matches(
     const McSeedGpuCandidate *candidate,
     const McSeedGpuStructureConfig *configs,

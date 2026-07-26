@@ -38,11 +38,23 @@ int32_t mcseed_spawn(
     McSeedHit *spawn,
     int32_t *biome_id
 );
+/** Refine a caller-provided modern spawn estimate without estimating it again. */
+int32_t mcseed_spawn_from_estimate(
+    McSeedContext *context,
+    int32_t estimate_x,
+    int32_t estimate_z,
+    McSeedHit *spawn,
+    int32_t *biome_id
+);
 
 /** Fast spawn estimate used by the conservative two-stage GPU prefilter. */
 int32_t mcseed_estimated_spawn(McSeedContext *context, McSeedHit *spawn);
+/** Slow reference path used to verify optimized spawn estimation. */
+int32_t mcseed_estimated_spawn_reference(McSeedContext *context, McSeedHit *spawn);
 /** Return 1 and the strict estimate-to-final horizontal bound when available. */
 int32_t mcseed_spawn_refinement_radius(uint32_t *radius);
+/** Return 1 and a strict origin-to-final-spawn horizontal bound when available. */
+int32_t mcseed_spawn_origin_radius(uint32_t *radius);
 
 int32_t mcseed_biome_count(void);
 const char *mcseed_biome_name_at(int32_t index);

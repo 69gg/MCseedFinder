@@ -353,4 +353,3 @@ double sampleBase3dNoise(BlendedNoise *bn, int x, int y, int z);
 #endif /* BIOMENOISE_H_ */
 
 
-

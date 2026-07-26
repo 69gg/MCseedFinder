@@ -48,6 +48,17 @@ typedef struct McSeedGpuPredicate {
     uint64_t minimum;
 } McSeedGpuPredicate;
 
+typedef struct McSeedGpuPairPredicate {
+    uint32_t left_config_offset;
+    uint32_t left_config_count;
+    uint32_t right_config_offset;
+    uint32_t right_config_count;
+    uint32_t left_radius;
+    uint32_t right_radius;
+    uint32_t anchor_radius;
+    uint32_t reserved;
+} McSeedGpuPairPredicate;
+
 typedef struct McSeedGpuCandidate {
     uint64_t seed;
     int32_t spawn_x;
@@ -57,10 +68,12 @@ typedef struct McSeedGpuCandidate {
 #ifdef __cplusplus
 static_assert(sizeof(McSeedGpuStructureConfig) == 24, "GPU config ABI changed");
 static_assert(sizeof(McSeedGpuPredicate) == 32, "GPU predicate ABI changed");
+static_assert(sizeof(McSeedGpuPairPredicate) == 32, "GPU pair predicate ABI changed");
 static_assert(sizeof(McSeedGpuCandidate) == 16, "GPU candidate ABI changed");
 #else
 _Static_assert(sizeof(McSeedGpuStructureConfig) == 24, "GPU config ABI changed");
 _Static_assert(sizeof(McSeedGpuPredicate) == 32, "GPU predicate ABI changed");
+_Static_assert(sizeof(McSeedGpuPairPredicate) == 32, "GPU pair predicate ABI changed");
 _Static_assert(sizeof(McSeedGpuCandidate) == 16, "GPU candidate ABI changed");
 #endif
 
@@ -71,6 +84,17 @@ void mcseed_gpu_reference_filter(
     const McSeedGpuStructureConfig *configs,
     size_t config_count,
     const McSeedGpuPredicate *predicates,
+    size_t predicate_count,
+    uint8_t *matches
+);
+
+/** CPU implementation of the pre-spawn pairwise necessary-condition filter. */
+void mcseed_gpu_reference_pair_filter(
+    const McSeedGpuCandidate *candidates,
+    size_t candidate_count,
+    const McSeedGpuStructureConfig *configs,
+    size_t config_count,
+    const McSeedGpuPairPredicate *predicates,
     size_t predicate_count,
     uint8_t *matches
 );

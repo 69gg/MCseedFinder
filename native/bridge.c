@@ -277,12 +277,16 @@ struct McSeedContext {
     uint64_t seed;
     uint8_t ready_mask;
     uint8_t spawn_ready;
+    uint8_t estimated_spawn_ready;
     Pos spawn;
+    Pos estimated_spawn;
+    uint64_t estimated_spawn_rng;
     int32_t spawn_y;
     int32_t spawn_biome;
     Piece *piece_buffer;
     McJigsawPiece *jigsaw_buffer;
     McJigsawWorkspace *jigsaw_workspace;
+    SpawnSearchWorkspace *spawn_search_workspace;
     TerrainNoise terrain;
     McSeedTerrainColumn terrain_columns[MCSEED_TERRAIN_COLUMN_CACHE_SIZE];
     uint8_t terrain_setup;
@@ -414,11 +418,13 @@ McSeedContext *mcseed_context_create(void)
         sizeof(*context->jigsaw_buffer)
     );
     context->jigsaw_workspace = mcjigsaw_workspace_create();
+    context->spawn_search_workspace = createSpawnSearchWorkspace();
     if (!context->piece_buffer || !context->jigsaw_buffer ||
-        !context->jigsaw_workspace) {
+        !context->jigsaw_workspace || !context->spawn_search_workspace) {
         free(context->piece_buffer);
         free(context->jigsaw_buffer);
         mcjigsaw_workspace_destroy(context->jigsaw_workspace);
+        freeSpawnSearchWorkspace(context->spawn_search_workspace);
         free(context);
         return NULL;
     }
@@ -440,6 +446,7 @@ void mcseed_context_destroy(McSeedContext *context)
     free(context->piece_buffer);
     free(context->jigsaw_buffer);
     mcjigsaw_workspace_destroy(context->jigsaw_workspace);
+    freeSpawnSearchWorkspace(context->spawn_search_workspace);
     free(context);
 }
 
@@ -450,7 +457,24 @@ void mcseed_context_set_seed(McSeedContext *context, uint64_t seed)
     context->seed = seed;
     context->ready_mask = 0;
     context->spawn_ready = 0;
+    context->estimated_spawn_ready = 0;
     context->terrain_ready = 0;
+}
+
+static void prepare_estimated_spawn(
+    McSeedContext *context,
+    const Generator *generator
+)
+{
+    if (context->estimated_spawn_ready)
+        return;
+    context->estimated_spawn_rng = 0;
+    context->estimated_spawn = estimateSpawnWithWorkspace(
+        generator,
+        &context->estimated_spawn_rng,
+        context->spawn_search_workspace
+    );
+    context->estimated_spawn_ready = 1;
 }
 
 int32_t mcseed_spawn(McSeedContext *context, McSeedHit *spawn, int32_t *biome_id)
@@ -467,7 +491,12 @@ int32_t mcseed_spawn(McSeedContext *context, McSeedHit *spawn, int32_t *biome_id
         float height = 64.0f;
         int height_sample_biome = none;
         int biome;
-        context->spawn = getSpawn(generator);
+        prepare_estimated_spawn(context, generator);
+        context->spawn = getSpawnForEstimate(
+            generator,
+            context->estimated_spawn,
+            context->estimated_spawn_rng
+        );
         initSurfaceNoise(&surface_noise, DIM_OVERWORLD, context->seed);
         if (mapApproxHeight(
                 &height,
@@ -502,7 +531,43 @@ int32_t mcseed_spawn(McSeedContext *context, McSeedHit *spawn, int32_t *biome_id
     return 0;
 }
 
+int32_t mcseed_spawn_from_estimate(
+    McSeedContext *context,
+    int32_t estimate_x,
+    int32_t estimate_z,
+    McSeedHit *spawn,
+    int32_t *biome_id
+)
+{
+    if (!context || !spawn || !biome_id)
+        return -1;
+    if (MCSEED_CUBIOMES_VERSION < MC_1_18)
+        return -2;
+    context->estimated_spawn.x = estimate_x;
+    context->estimated_spawn.z = estimate_z;
+    context->estimated_spawn_rng = 0;
+    context->estimated_spawn_ready = 1;
+    context->spawn_ready = 0;
+    return mcseed_spawn(context, spawn, biome_id);
+}
+
 int32_t mcseed_estimated_spawn(McSeedContext *context, McSeedHit *spawn)
+{
+    Generator *generator;
+    if (!context || !spawn)
+        return -1;
+    generator = generator_for_dimension(context, DIM_OVERWORLD);
+    if (!generator)
+        return -2;
+    prepare_estimated_spawn(context, generator);
+    spawn->x = context->estimated_spawn.x;
+    spawn->y = INT32_MIN;
+    spawn->z = context->estimated_spawn.z;
+    spawn->id = 0;
+    return 0;
+}
+
+int32_t mcseed_estimated_spawn_reference(McSeedContext *context, McSeedHit *spawn)
 {
     Generator *generator;
     Pos position;
@@ -511,7 +576,7 @@ int32_t mcseed_estimated_spawn(McSeedContext *context, McSeedHit *spawn)
     generator = generator_for_dimension(context, DIM_OVERWORLD);
     if (!generator)
         return -2;
-    position = estimateSpawn(generator, NULL);
+    position = estimateSpawnReference(generator, NULL);
     spawn->x = position.x;
     spawn->y = INT32_MIN;
     spawn->z = position.z;
@@ -539,6 +604,25 @@ int32_t mcseed_spawn_refinement_radius(uint32_t *radius)
     while (horizontal_bound * horizontal_bound < squared_bound)
         horizontal_bound++;
     *radius = horizontal_bound;
+    return 1;
+}
+
+int32_t mcseed_spawn_origin_radius(uint32_t *radius)
+{
+    uint32_t refinement_radius;
+    int estimate_radius;
+    int32_t status;
+    if (!radius)
+        return -1;
+    estimate_radius = getSpawnEstimateOriginRadius(MCSEED_CUBIOMES_VERSION);
+    if (estimate_radius <= 0)
+        return 0;
+    status = mcseed_spawn_refinement_radius(&refinement_radius);
+    if (status != 1)
+        return status;
+    if ((uint32_t)estimate_radius > UINT32_MAX - refinement_radius)
+        return -2;
+    *radius = (uint32_t)estimate_radius + refinement_radius;
     return 1;
 }
 

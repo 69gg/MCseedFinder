@@ -113,7 +113,7 @@ mcseed-finder find \
   --progress
 ```
 
-GPU 先批量检查结构的随机放置候选；出生点锚定条件会先用严格扩大半径粗筛，只为幸存者计算完整出生点，再按原半径精筛。CPU 多线程最后执行生物群系、地形、Jigsaw 子部件等完整校验。因此输出与 CPU 路径保持同一语义，不会把仅通过放置候选的种子直接当成结果。
+GPU 会先用共享出生点的结构条件做无需生成出生点的共址必要条件筛选，再批量检查结构的随机放置候选；只有幸存者才会进入 CPU 出生点估算。出生点锚定条件随后用严格扩大半径粗筛，并从已保存的估计点继续细化出生点，再按原半径精筛。CPU 多线程最后执行生物群系、地形、Jigsaw 子部件等完整校验。因此输出与 CPU 路径保持同一语义，不会把仅通过放置候选的种子直接当成结果。
 
 搜索周边生物群系：
 
@@ -140,8 +140,8 @@ mcseed-finder check 0 --biome-near overworld:sulfur_caves:1024:-64..64
 - `find --random` 使用完整有符号 64 位种子空间的伪随机全排列，不会重复抽取种子。省略 `--random-seed` 时会生成随机化键并立即写到 stderr；使用相同键和条件可以复现相同结果顺序。
 - 命令行显式传入 `--random` 时会覆盖配置文件中的 `start`/`end`，便于复用只为顺序搜索编写的条件文件；JSON 自身若设置 `"random": true`，则不能再包含 `start`/`end`。
 - `--count N` 指定目标结果数。随机模式省略 `--max-attempts` 时会持续搜索到找满，或在理论上遍历完全部 2^64 个种子；可以随时按 Ctrl+C 停止。
-- `--threads N` 控制并行度，默认使用 `available_parallelism` 返回的可用逻辑 CPU 数。工作线程和各自的世界生成上下文会在整次搜索中复用。
-- `--batch-size` 控制任务派发粒度，默认 4096。通常无需调整；更小的值会缩短停止响应批次，更大的值适合单个条件非常便宜的搜索。
+- `--threads N` 控制并行度，默认使用 `available_parallelism` 返回的可用逻辑 CPU 数。工作线程和各自的世界生成上下文会在整次搜索中复用；出生点准备、估算与细化使用共享动态分片，空闲线程会继续领取任务，避免少量长尾种子闲置其他核心。
+- `--batch-size` 控制 GPU 批处理、进度刷新和停止检查粒度，默认 4096。更大的值可以摊薄很便宜查询的固定开销，但会增加内存占用、进度刷新间隔和找到足够结果后的停止延迟；出生点 CPU 工作会在批次内部继续动态均衡。
 - `--accelerator auto|cpu|cuda|rocm` 控制搜索后端。`auto` 是默认值；显式选择 CUDA/ROCm 时，后端未编译、设备不可用或条件无法安全下推都会直接报错。
 - `--gpu-device INDEX` 选择 GPU，默认是 0；它不能和 `--accelerator cpu` 一起使用。CPU 线程仍负责出生点准备和精确复核，因此 GPU 模式下 `--threads` 依然有效。
 - `--format jsonl` 适合交给其他程序继续处理。匹配失败时 `check` 和没有结果的 `find` 返回退出码 1，参数或运行错误返回 2。
@@ -258,7 +258,7 @@ JSON 中也可以启用随机模式。随机模式不能同时设置 `start`/`en
 
 名称不需要猜：用 `list pieces --structure STRUCTURE` 获取程序实际接受的分组和精确名称。
 
-GPU 预筛选覆盖注册表中采用随机分区放置的 20 个结构族；废弃矿井和要塞没有这种放置模型，继续由 CPU 处理。它会自动提取必须成立的正向 `structure_near` 条件，以及正向 `structure_piece_near` 所必需的父结构候选。`any`、`not`、纯上限/排除条件不会被不安全地下推；不能加速的条件始终留在 CPU 精确路径中。
+GPU 预筛选覆盖注册表中采用随机分区放置的 20 个结构族；废弃矿井和要塞没有这种放置模型，继续由 CPU 处理。它会自动提取必须成立的正向 `structure_near` 条件、正向 `structure_piece_near` 所必需的父结构候选，以及共享同一出生点锚点的结构对所必须满足的共址关系。`any`、`not`、纯上限/排除条件不会被不安全地下推；不能加速的条件始终留在 CPU 精确路径中。
 
 如果要在游戏中长期使用找到的种子，建议先用 `check` 保存见证坐标，再在原版 26.2 中做一次最终确认。
 
@@ -274,7 +274,7 @@ cargo test --offline --features cuda
 cargo test --offline --features rocm
 ```
 
-`scripts/test-native-sanitizer.sh` 需要 Clang，并用 AddressSanitizer 与 UndefinedBehaviorSanitizer 独立检查 C 世界生成桥接和共享的 GPU 放置参考实现；默认同时启用 LeakSanitizer。若运行环境处于 ptrace 下而无法启动 LSan，可设置 `MCSEED_ASAN_DETECT_LEAKS=0`，地址与未定义行为检查仍会执行。测试覆盖配置严格校验、名称注册表、村庄铁匠铺/房屋的确定性布局、沉船与宝藏部件、最近要塞的眼框掩码、26.2 新生物群系、全部结构族、负坐标下界投影、并行搜索顺序、随机全排列、跨线程结果一致性、GPU 保守性与设备内核一致性、CLI JSON 输出和已知种子回归值。
+`scripts/test-native-sanitizer.sh` 需要 Clang，并用 AddressSanitizer 与 UndefinedBehaviorSanitizer 独立检查 C 世界生成桥接和共享的 GPU 放置参考实现；默认同时启用 LeakSanitizer。若运行环境处于 ptrace 下而无法启动 LSan，可设置 `MCSEED_ASAN_DETECT_LEAKS=0`，地址与未定义行为检查仍会执行。测试覆盖配置严格校验、名称注册表、村庄铁匠铺/房屋的确定性布局、沉船与宝藏部件、最近要塞的眼框掩码、26.2 新生物群系、出生点优化与参考实现的一致性、动态分片无遗漏/无重复、全部结构族、结构对共址预筛选、负坐标下界投影、并行搜索顺序、随机全排列、跨线程结果一致性、GPU 保守性与设备内核一致性、CLI JSON 输出和已知种子回归值。
 
 ## 扩展 Minecraft 版本
 

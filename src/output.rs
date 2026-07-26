@@ -44,6 +44,14 @@ pub fn write_search_summary(outcome: &SearchOutcome) {
     );
     if outcome.gpu_candidates > 0 {
         let retained = outcome.gpu_survivors as f64 * 100.0 / outcome.gpu_candidates as f64;
+        if outcome.gpu_pre_spawn_candidates > 0 {
+            let pre_spawn_retained = outcome.gpu_pre_spawn_survivors as f64 * 100.0
+                / outcome.gpu_pre_spawn_candidates as f64;
+            eprintln!(
+                "GPU 出生点前共址预筛：保留 {}/{}（{pre_spawn_retained:.3}%）",
+                outcome.gpu_pre_spawn_survivors, outcome.gpu_pre_spawn_candidates
+            );
+        }
         if outcome.gpu_coarse_candidates > 0 {
             let coarse_retained =
                 outcome.gpu_coarse_survivors as f64 * 100.0 / outcome.gpu_coarse_candidates as f64;
@@ -58,6 +66,20 @@ pub fn write_search_summary(outcome: &SearchOutcome) {
             outcome.gpu_survivors,
             outcome.gpu_candidates
         );
+        if let Some(timings) = outcome.gpu_timings {
+            let overhead = outcome.elapsed.saturating_sub(timings.measured());
+            eprintln!(
+                "GPU 流水线耗时：种子准备 {:.3}s，出生点前预筛 {:.3}s，出生点估算 {:.3}s，粗筛 {:.3}s，出生点细化 {:.3}s，最终预筛 {:.3}s，CPU 精确复核 {:.3}s，其他 {:.3}s",
+                timings.candidate_preparation.as_secs_f64(),
+                timings.pre_spawn_filter.as_secs_f64(),
+                timings.spawn_estimation.as_secs_f64(),
+                timings.coarse_filter.as_secs_f64(),
+                timings.spawn_refinement.as_secs_f64(),
+                timings.exact_filter.as_secs_f64(),
+                timings.cpu_validation.as_secs_f64(),
+                overhead.as_secs_f64(),
+            );
+        }
     }
     if outcome.exhausted {
         eprintln!(

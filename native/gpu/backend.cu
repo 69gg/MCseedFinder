@@ -57,10 +57,12 @@ typedef struct McSeedGpuContext {
     McSeedGpuStream stream;
     McSeedGpuStructureConfig *configs;
     McSeedGpuPredicate *predicates;
+    McSeedGpuPairPredicate *pair_predicates;
     McSeedGpuCandidate *candidates;
     uint8_t *matches;
     size_t config_count;
     size_t predicate_count;
+    size_t pair_predicate_count;
     size_t candidate_capacity;
 } McSeedGpuContext;
 
@@ -101,15 +103,22 @@ __global__ static void mcseed_gpu_prefilter_kernel(
     const McSeedGpuStructureConfig *configs,
     const McSeedGpuPredicate *predicates,
     size_t predicate_count,
+    const McSeedGpuPairPredicate *pair_predicates,
+    size_t pair_predicate_count,
     uint8_t *matches
 )
 {
     size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= candidate_count)
         return;
-    matches[index] = (uint8_t)mcseed_gpu_candidate_matches(
+    int matched = predicate_count == 0 || mcseed_gpu_candidate_matches(
         &candidates[index], configs, predicates, predicate_count
     );
+    if (matched && pair_predicate_count != 0)
+        matched = mcseed_gpu_candidate_matches_pairs(
+            &candidates[index], configs, pair_predicates, pair_predicate_count
+        );
+    matches[index] = (uint8_t)matched;
 }
 
 extern "C" const char *mcseed_gpu_backend_name(void)
@@ -178,6 +187,8 @@ static void mcseed_gpu_context_cleanup(McSeedGpuContext *context)
         (void)mcseed_gpu_free(context->configs);
     if (context->predicates)
         (void)mcseed_gpu_free(context->predicates);
+    if (context->pair_predicates)
+        (void)mcseed_gpu_free(context->pair_predicates);
     if (context->stream)
         (void)mcseed_gpu_stream_destroy(context->stream);
     free(context);
@@ -189,12 +200,17 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
     size_t config_count,
     const McSeedGpuPredicate *predicates,
     size_t predicate_count,
+    const McSeedGpuPairPredicate *pair_predicates,
+    size_t pair_predicate_count,
     char *error,
     size_t error_capacity
 )
 {
     McSeedGpuContext *context;
-    if (!configs || config_count == 0 || !predicates || predicate_count == 0) {
+    if (!configs || config_count == 0 ||
+        (!predicates && predicate_count != 0) ||
+        (!pair_predicates && pair_predicate_count != 0) ||
+        (predicate_count == 0 && pair_predicate_count == 0)) {
         if (error && error_capacity)
             snprintf(error, error_capacity, "GPU 预筛选计划不能为空");
         return NULL;
@@ -208,6 +224,7 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
     context->device = device;
     context->config_count = config_count;
     context->predicate_count = predicate_count;
+    context->pair_predicate_count = pair_predicate_count;
 
     if (!mcseed_gpu_check(
             mcseed_gpu_set_device(device), error, error_capacity, "选择 GPU 设备"
@@ -225,15 +242,6 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
             "分配 GPU 结构配置"
         ) ||
         !mcseed_gpu_check(
-            mcseed_gpu_malloc(
-                (void **)&context->predicates,
-                predicate_count * sizeof(*predicates)
-            ),
-            error,
-            error_capacity,
-            "分配 GPU 条件配置"
-        ) ||
-        !mcseed_gpu_check(
             mcseed_gpu_memcpy_async(
                 context->configs,
                 configs,
@@ -244,6 +252,19 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
             error,
             error_capacity,
             "上传 GPU 结构配置"
+        )) {
+        mcseed_gpu_context_cleanup(context);
+        return NULL;
+    }
+    if (predicate_count != 0 &&
+        (!mcseed_gpu_check(
+            mcseed_gpu_malloc(
+                (void **)&context->predicates,
+                predicate_count * sizeof(*predicates)
+            ),
+            error,
+            error_capacity,
+            "分配 GPU 条件配置"
         ) ||
         !mcseed_gpu_check(
             mcseed_gpu_memcpy_async(
@@ -256,8 +277,36 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
             error,
             error_capacity,
             "上传 GPU 条件配置"
+        ))) {
+        mcseed_gpu_context_cleanup(context);
+        return NULL;
+    }
+    if (pair_predicate_count != 0 &&
+        (!mcseed_gpu_check(
+            mcseed_gpu_malloc(
+                (void **)&context->pair_predicates,
+                pair_predicate_count * sizeof(*pair_predicates)
+            ),
+            error,
+            error_capacity,
+            "分配 GPU 共址条件配置"
         ) ||
         !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                context->pair_predicates,
+                pair_predicates,
+                pair_predicate_count * sizeof(*pair_predicates),
+                MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "上传 GPU 共址条件配置"
+        ))) {
+        mcseed_gpu_context_cleanup(context);
+        return NULL;
+    }
+    if (!mcseed_gpu_check(
             mcseed_gpu_stream_synchronize(context->stream),
             error,
             error_capacity,
@@ -372,6 +421,8 @@ extern "C" int32_t mcseed_gpu_filter(
         context->configs,
         context->predicates,
         context->predicate_count,
+        context->pair_predicates,
+        context->pair_predicate_count,
         context->matches
     );
 #else
@@ -381,6 +432,8 @@ extern "C" int32_t mcseed_gpu_filter(
         context->configs,
         context->predicates,
         context->predicate_count,
+        context->pair_predicates,
+        context->pair_predicate_count,
         context->matches
     );
 #endif

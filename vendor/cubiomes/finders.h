@@ -379,6 +379,23 @@ int nextStronghold(StrongholdIter *sh, const Generator *g);
  * The random state 'rng' output can be NULL to ignore.
  */
 Pos estimateSpawn(const Generator *g, uint64_t *rng);
+typedef struct SpawnSearchWorkspace SpawnSearchWorkspace;
+SpawnSearchWorkspace *createSpawnSearchWorkspace(void);
+void freeSpawnSearchWorkspace(SpawnSearchWorkspace *workspace);
+Pos estimateSpawnWithWorkspace(const Generator *g, uint64_t *rng,
+    SpawnSearchWorkspace *workspace);
+/* Slow reference implementation retained for optimized-spawn parity tests. */
+Pos estimateSpawnReference(const Generator *g, uint64_t *rng);
+/* Returns a strict horizontal origin-to-estimate radius for supported versions,
+ * or zero when the current spawn algorithm has no static bound here.
+ */
+int getSpawnEstimateOriginRadius(int mc);
+
+/* Refines a spawn estimate without repeating estimateSpawn().
+ * For versions up to 1.17, 'rng' must be the state returned by
+ * estimateSpawn(); newer versions ignore it.
+ */
+Pos getSpawnForEstimate(const Generator *g, Pos spawn, uint64_t rng);
 
 /* Finds the spawn point in the world.
  * Warning: Slow, and may be inaccurate because the world spawn depends on
@@ -1343,4 +1360,3 @@ Pos getLargeStructurePos(StructureConfig config, uint64_t seed, int regX, int re
 #endif
 
 #endif // FINDERS_H_
-
