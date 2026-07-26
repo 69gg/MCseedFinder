@@ -64,6 +64,7 @@ unsafe extern "C" {
     fn mcseed_estimated_spawn_reference(context: *mut RawContext, spawn: *mut RawHit) -> c_int;
     fn mcseed_spawn_refinement_radius(radius: *mut c_uint) -> c_int;
     fn mcseed_spawn_origin_radius(radius: *mut c_uint) -> c_int;
+    fn mcseed_gpu_spawn_config(config: *mut GpuSpawnConfig) -> c_int;
 
     fn mcseed_biome_count() -> c_int;
     fn mcseed_biome_name_at(index: c_int) -> *const c_char;
@@ -172,6 +173,8 @@ pub(crate) struct GpuStructureConfig {
     pub reserved: i32,
 }
 
+pub(crate) const GPU_PLACEMENT_STRONGHOLD: i32 = 7;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GpuPredicate {
@@ -203,6 +206,70 @@ pub(crate) struct GpuCandidate {
     pub seed: u64,
     pub spawn_x: i32,
     pub spawn_z: i32,
+}
+
+pub(crate) const GPU_SPAWN_MULTI_NOISE_ORIGIN_BIAS: u32 = 1;
+pub(crate) const GPU_SPAWN_NOISE_COUNT: usize = 6;
+pub(crate) const GPU_SPAWN_TARGET_COUNT: usize = 7;
+pub(crate) const GPU_SPAWN_MAX_PERLINS: usize = 48;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct GpuSpawnNoise {
+    pub octave_a_offset: u32,
+    pub octave_a_count: u32,
+    pub octave_b_offset: u32,
+    pub octave_b_count: u32,
+    pub amplitude: f64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct GpuSpawnPerlin {
+    pub parameter_seed_xor_lo: u64,
+    pub parameter_seed_xor_hi: u64,
+    pub octave_seed_xor_lo: u64,
+    pub octave_seed_xor_hi: u64,
+    pub amplitude: f64,
+    pub lacunarity: f64,
+    pub half: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GpuSpawnConfig {
+    pub algorithm: u32,
+    pub noise_count: u32,
+    pub perlin_count: u32,
+    pub outer_radius: u32,
+    pub outer_step: u32,
+    pub inner_radius: u32,
+    pub inner_step: u32,
+    pub reserved: u32,
+    pub fitness_scale: u64,
+    pub noises: [GpuSpawnNoise; GPU_SPAWN_NOISE_COUNT],
+    pub perlins: [GpuSpawnPerlin; GPU_SPAWN_MAX_PERLINS],
+    pub targets: [[i64; 2]; GPU_SPAWN_TARGET_COUNT],
+}
+
+impl Default for GpuSpawnConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: 0,
+            noise_count: 0,
+            perlin_count: 0,
+            outer_radius: 0,
+            outer_step: 0,
+            inner_radius: 0,
+            inner_step: 0,
+            reserved: 0,
+            fitness_scale: 0,
+            noises: [GpuSpawnNoise::default(); GPU_SPAWN_NOISE_COUNT],
+            perlins: [GpuSpawnPerlin::default(); GPU_SPAWN_MAX_PERLINS],
+            targets: [[0; 2]; GPU_SPAWN_TARGET_COUNT],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +748,10 @@ pub(crate) fn gpu_structure_config(structure_id: i32) -> Result<Option<GpuStruct
             if config.kind <= 0 || config.region_size <= 0 || config.chunk_range <= 0 {
                 bail!("结构 {structure_id} 返回了无效的 GPU 放置配置");
             }
+            if config.kind == GPU_PLACEMENT_STRONGHOLD && (config.salt <= 0 || config.reserved < 0)
+            {
+                bail!("结构 {structure_id} 返回了无效的 GPU 强要塞配置");
+            }
             Ok(Some(config))
         }
         0 => Ok(None),
@@ -703,6 +774,42 @@ pub(crate) fn spawn_origin_radius() -> Result<Option<u32>> {
         1 => Ok(Some(radius)),
         0 => Ok(None),
         status => bail!("读取出生点原点半径失败（错误码 {status}）"),
+    }
+}
+
+pub(crate) fn gpu_spawn_config() -> Result<Option<GpuSpawnConfig>> {
+    let mut config = GpuSpawnConfig::default();
+    match unsafe { mcseed_gpu_spawn_config(&mut config) } {
+        1 => {
+            if config.algorithm != GPU_SPAWN_MULTI_NOISE_ORIGIN_BIAS
+                || config.noise_count as usize != GPU_SPAWN_NOISE_COUNT
+                || config.perlin_count as usize > GPU_SPAWN_MAX_PERLINS
+                || config.perlin_count == 0
+                || config.outer_step == 0
+                || config.inner_step == 0
+                || config.outer_radius < config.outer_step
+                || config.inner_radius < config.inner_step
+                || config.fitness_scale == 0
+            {
+                bail!("当前版本返回了无效的 GPU 出生点配置");
+            }
+            for noise in &config.noises {
+                let a_end = noise
+                    .octave_a_offset
+                    .checked_add(noise.octave_a_count)
+                    .ok_or_else(|| anyhow!("GPU 出生点 octave A 范围溢出"))?;
+                let b_end = noise
+                    .octave_b_offset
+                    .checked_add(noise.octave_b_count)
+                    .ok_or_else(|| anyhow!("GPU 出生点 octave B 范围溢出"))?;
+                if a_end > config.perlin_count || b_end > config.perlin_count {
+                    bail!("GPU 出生点噪声引用了范围外的 Perlin octave");
+                }
+            }
+            Ok(Some(config))
+        }
+        0 => Ok(None),
+        status => bail!("读取 GPU 出生点配置失败（错误码 {status}）"),
     }
 }
 
@@ -827,8 +934,9 @@ fn optional_c_string(pointer: *const c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuCandidate, GpuPairPredicate, GpuPredicate, GpuStructureConfig, NativeContext,
-        PieceAccuracy, biome_by_name, biomes, piece_selector, pieces, spawn_origin_radius,
+        GPU_SPAWN_MAX_PERLINS, GpuCandidate, GpuPairPredicate, GpuPredicate, GpuSpawnConfig,
+        GpuSpawnNoise, GpuSpawnPerlin, GpuStructureConfig, NativeContext, PieceAccuracy,
+        biome_by_name, biomes, gpu_spawn_config, piece_selector, pieces, spawn_origin_radius,
         spawn_refinement_radius, structure_by_name, structures,
     };
     use crate::domain::Dimension;
@@ -851,6 +959,29 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuPredicate>(), 32);
         assert_eq!(std::mem::size_of::<GpuPairPredicate>(), 32);
         assert_eq!(std::mem::size_of::<GpuCandidate>(), 16);
+        assert_eq!(std::mem::size_of::<GpuSpawnNoise>(), 24);
+        assert_eq!(std::mem::size_of::<GpuSpawnPerlin>(), 56);
+        assert_eq!(std::mem::size_of::<GpuSpawnConfig>(), 2_984);
+    }
+
+    #[test]
+    fn active_version_exposes_a_complete_gpu_spawn_profile() {
+        let config = gpu_spawn_config()
+            .expect("GPU 出生点配置")
+            .expect("当前版本应支持 GPU 出生点估算");
+        assert_eq!(config.perlin_count, 46);
+        assert!(config.perlin_count as usize <= GPU_SPAWN_MAX_PERLINS);
+        assert_eq!((config.outer_radius, config.outer_step), (2_048, 512));
+        assert_eq!((config.inner_radius, config.inner_step), (512, 32));
+        assert_eq!(config.fitness_scale, 2_048 * 2_048);
+        assert_eq!(
+            config
+                .noises
+                .iter()
+                .map(|noise| noise.octave_a_count + noise.octave_b_count)
+                .sum::<u32>(),
+            config.perlin_count
+        );
     }
 
     #[test]

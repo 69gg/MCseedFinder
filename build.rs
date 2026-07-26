@@ -104,6 +104,7 @@ fn compile_gpu_backend(target_os: &str, target_arch: &str) {
             .std("c++17")
             .warnings(false)
             .flag_if_supported("-O3")
+            .flag("--fmad=false")
             .compile("mcseed_gpu_backend");
     }
 
@@ -122,6 +123,7 @@ fn compile_gpu_backend(target_os: &str, target_arch: &str) {
             .std("c++17")
             .warnings(false)
             .flag_if_supported("-O3")
+            .flag_if_supported("-ffp-contract=off")
             .compile("mcseed_gpu_backend");
 
         if let Some(root) = rocm_root(&hipcc) {

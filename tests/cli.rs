@@ -11,6 +11,11 @@ fn run(arguments: &[&str]) -> Output {
         .expect("CLI 应能启动")
 }
 
+#[cfg(feature = "cuda")]
+const COMPILED_GPU_BACKEND: &str = "cuda";
+#[cfg(feature = "rocm")]
+const COMPILED_GPU_BACKEND: &str = "rocm";
+
 fn json_lines(output: &Output) -> Vec<Value> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -309,6 +314,135 @@ fn random_search_honors_requested_count_without_duplicates() {
         .collect();
     assert_eq!(seeds.len(), 7);
     assert_eq!(seeds.iter().copied().collect::<HashSet<_>>().len(), 7);
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[test]
+fn gpu_spawn_pipeline_matches_cpu_across_batch_and_thread_counts_when_available() {
+    let probe = run(&[
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "1",
+        "--count",
+        "1",
+        "--accelerator",
+        COMPILED_GPU_BACKEND,
+        "--structure-near",
+        "village:1024",
+        "--format",
+        "jsonl",
+    ]);
+    if !probe.status.success() {
+        let error = String::from_utf8_lossy(&probe.stderr);
+        if error.contains("没有检测到") || error.contains("运行时不可用") {
+            return;
+        }
+        panic!("GPU 探测失败：{error}");
+    }
+
+    let common = [
+        "find",
+        "--start",
+        "-16",
+        "--end",
+        "128",
+        "--count",
+        "8",
+        "--structure-near",
+        "village:1024",
+        "--format",
+        "jsonl",
+    ];
+    let mut cpu_arguments = common.to_vec();
+    cpu_arguments.extend([
+        "--accelerator",
+        "cpu",
+        "--threads",
+        "4",
+        "--batch-size",
+        "7",
+    ]);
+    let mut single_gpu_arguments = common.to_vec();
+    single_gpu_arguments.extend([
+        "--accelerator",
+        COMPILED_GPU_BACKEND,
+        "--threads",
+        "1",
+        "--batch-size",
+        "1",
+    ]);
+    let mut parallel_gpu_arguments = common.to_vec();
+    parallel_gpu_arguments.extend([
+        "--accelerator",
+        COMPILED_GPU_BACKEND,
+        "--threads",
+        "4",
+        "--batch-size",
+        "9",
+    ]);
+
+    let cpu = run(&cpu_arguments);
+    let single_gpu = run(&single_gpu_arguments);
+    let parallel_gpu = run(&parallel_gpu_arguments);
+    for output in [&cpu, &single_gpu, &parallel_gpu] {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let expected = json_lines(&cpu);
+    assert_eq!(expected.len(), 8);
+    assert_eq!(json_lines(&single_gpu), expected);
+    assert_eq!(json_lines(&parallel_gpu), expected);
+
+    let random_common = [
+        "find",
+        "--random",
+        "--random-seed",
+        "20260726",
+        "--max-attempts",
+        "64",
+        "--count",
+        "6",
+        "--structure-near",
+        "village:1024",
+        "--format",
+        "jsonl",
+    ];
+    let mut random_cpu_arguments = random_common.to_vec();
+    random_cpu_arguments.extend([
+        "--accelerator",
+        "cpu",
+        "--threads",
+        "3",
+        "--batch-size",
+        "5",
+    ]);
+    let mut random_gpu_arguments = random_common.to_vec();
+    random_gpu_arguments.extend([
+        "--accelerator",
+        COMPILED_GPU_BACKEND,
+        "--threads",
+        "4",
+        "--batch-size",
+        "7",
+    ]);
+    let random_cpu = run(&random_cpu_arguments);
+    let random_gpu = run(&random_gpu_arguments);
+    assert!(
+        random_cpu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&random_cpu.stderr)
+    );
+    assert!(
+        random_gpu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&random_gpu.stderr)
+    );
+    assert_eq!(json_lines(&random_gpu), json_lines(&random_cpu));
 }
 
 #[test]

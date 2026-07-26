@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,7 @@ typedef cudaStream_t McSeedGpuStream;
 #endif
 
 #include "placement.h"
+#include "spawn.h"
 
 typedef struct McSeedGpuContext {
     int32_t device;
@@ -58,11 +60,16 @@ typedef struct McSeedGpuContext {
     McSeedGpuStructureConfig *configs;
     McSeedGpuPredicate *predicates;
     McSeedGpuPairPredicate *pair_predicates;
+    McSeedGpuSpawnConfig *spawn_config;
+    McSeedGpuSpawnOffset *outer_spawn_offsets;
+    McSeedGpuSpawnOffset *inner_spawn_offsets;
     McSeedGpuCandidate *candidates;
     uint8_t *matches;
     size_t config_count;
     size_t predicate_count;
     size_t pair_predicate_count;
+    uint32_t outer_spawn_offset_count;
+    uint32_t inner_spawn_offset_count;
     size_t candidate_capacity;
 } McSeedGpuContext;
 
@@ -189,9 +196,149 @@ static void mcseed_gpu_context_cleanup(McSeedGpuContext *context)
         (void)mcseed_gpu_free(context->predicates);
     if (context->pair_predicates)
         (void)mcseed_gpu_free(context->pair_predicates);
+    if (context->spawn_config)
+        (void)mcseed_gpu_free(context->spawn_config);
+    if (context->outer_spawn_offsets)
+        (void)mcseed_gpu_free(context->outer_spawn_offsets);
+    if (context->inner_spawn_offsets)
+        (void)mcseed_gpu_free(context->inner_spawn_offsets);
     if (context->stream)
         (void)mcseed_gpu_stream_destroy(context->stream);
     free(context);
+}
+
+static uint32_t mcseed_gpu_build_spawn_offsets(
+    McSeedGpuSpawnOffset *offsets,
+    uint32_t capacity,
+    uint32_t maximum_radius,
+    uint32_t step
+)
+{
+    const double full_turn = 3.14159265358979323846 * 2.0;
+    float radius;
+    float angle = 0.0F;
+    uint32_t count = 0;
+    if (!offsets || step == 0)
+        return 0;
+    radius = (float)step;
+    while (radius <= (float)maximum_radius) {
+        if (count == capacity)
+            return 0;
+        offsets[count].x = (int32_t)(sin((double)angle) * radius);
+        offsets[count].z = (int32_t)(cos((double)angle) * radius);
+        count++;
+        angle += (float)step / radius;
+        if ((double)angle > full_turn) {
+            angle = 0.0F;
+            radius += (float)step;
+        }
+    }
+    return count;
+}
+
+static int mcseed_gpu_prepare_spawn_estimator(
+    McSeedGpuContext *context,
+    const McSeedGpuSpawnConfig *spawn_config,
+    char *error,
+    size_t error_capacity
+)
+{
+    McSeedGpuSpawnOffset outer_offsets[MCSEED_GPU_SPAWN_MAX_OFFSETS];
+    McSeedGpuSpawnOffset inner_offsets[MCSEED_GPU_SPAWN_MAX_OFFSETS];
+    uint32_t outer_count;
+    uint32_t inner_count;
+    if (!spawn_config)
+        return 1;
+    if (spawn_config->algorithm != MCSEED_GPU_SPAWN_MULTI_NOISE_ORIGIN_BIAS ||
+        spawn_config->noise_count != MCSEED_GPU_SPAWN_NOISE_COUNT ||
+        spawn_config->perlin_count == 0 ||
+        spawn_config->perlin_count > MCSEED_GPU_SPAWN_MAX_PERLINS ||
+        spawn_config->fitness_scale == 0) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity, "GPU 出生点配置无效或不受支持");
+        return 0;
+    }
+    outer_count = mcseed_gpu_build_spawn_offsets(
+        outer_offsets,
+        MCSEED_GPU_SPAWN_MAX_OFFSETS,
+        spawn_config->outer_radius,
+        spawn_config->outer_step
+    );
+    inner_count = mcseed_gpu_build_spawn_offsets(
+        inner_offsets,
+        MCSEED_GPU_SPAWN_MAX_OFFSETS,
+        spawn_config->inner_radius,
+        spawn_config->inner_step
+    );
+    if (outer_count == 0 || inner_count == 0) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity, "GPU 出生点搜索偏移配置无效");
+        return 0;
+    }
+    if (!mcseed_gpu_check(
+            mcseed_gpu_malloc((void **)&context->spawn_config, sizeof(*spawn_config)),
+            error,
+            error_capacity,
+            "分配 GPU 出生点配置"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_malloc(
+                (void **)&context->outer_spawn_offsets,
+                outer_count * sizeof(*outer_offsets)
+            ),
+            error,
+            error_capacity,
+            "分配 GPU 出生点外层偏移"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_malloc(
+                (void **)&context->inner_spawn_offsets,
+                inner_count * sizeof(*inner_offsets)
+            ),
+            error,
+            error_capacity,
+            "分配 GPU 出生点内层偏移"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                context->spawn_config,
+                spawn_config,
+                sizeof(*spawn_config),
+                MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "上传 GPU 出生点配置"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                context->outer_spawn_offsets,
+                outer_offsets,
+                outer_count * sizeof(*outer_offsets),
+                MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "上传 GPU 出生点外层偏移"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                context->inner_spawn_offsets,
+                inner_offsets,
+                inner_count * sizeof(*inner_offsets),
+                MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "上传 GPU 出生点内层偏移"
+        ))
+        return 0;
+    context->outer_spawn_offset_count = outer_count;
+    context->inner_spawn_offset_count = inner_count;
+    return 1;
 }
 
 extern "C" McSeedGpuContext *mcseed_gpu_context_create(
@@ -202,6 +349,7 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
     size_t predicate_count,
     const McSeedGpuPairPredicate *pair_predicates,
     size_t pair_predicate_count,
+    const McSeedGpuSpawnConfig *spawn_config,
     char *error,
     size_t error_capacity
 )
@@ -306,6 +454,12 @@ extern "C" McSeedGpuContext *mcseed_gpu_context_create(
         mcseed_gpu_context_cleanup(context);
         return NULL;
     }
+    if (!mcseed_gpu_prepare_spawn_estimator(
+            context, spawn_config, error, error_capacity
+        )) {
+        mcseed_gpu_context_cleanup(context);
+        return NULL;
+    }
     if (!mcseed_gpu_check(
             mcseed_gpu_stream_synchronize(context->stream),
             error,
@@ -379,7 +533,7 @@ extern "C" int32_t mcseed_gpu_filter(
     size_t error_capacity
 )
 {
-    const uint32_t threads = 256;
+    const uint32_t threads = MCSEED_GPU_SPAWN_BLOCK_THREADS;
     uint32_t blocks;
     if (!context || (!candidates && candidate_count) || (!matches && candidate_count))
         return -1;
@@ -459,5 +613,100 @@ extern "C" int32_t mcseed_gpu_filter(
             "同步 GPU 预筛选"
         ))
         return -4;
+    return 0;
+}
+
+extern "C" int32_t mcseed_gpu_estimate_spawns(
+    McSeedGpuContext *context,
+    const McSeedGpuCandidate *candidates,
+    size_t candidate_count,
+    McSeedGpuCandidate *estimates,
+    char *error,
+    size_t error_capacity
+)
+{
+    const uint32_t threads = MCSEED_GPU_SPAWN_BLOCK_THREADS;
+    uint32_t blocks;
+    if (!context || (!candidates && candidate_count) || (!estimates && candidate_count))
+        return -1;
+    if (!context->spawn_config) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity, "当前 GPU 上下文未启用出生点估算");
+        return -2;
+    }
+    if (candidate_count == 0)
+        return 0;
+    if (candidate_count > UINT32_MAX) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity, "单批 GPU 出生点候选数过大");
+        return -3;
+    }
+    if (!mcseed_gpu_check(
+            mcseed_gpu_set_device(context->device), error, error_capacity, "选择 GPU 设备"
+        ) ||
+        !mcseed_gpu_reserve_candidates(context, candidate_count, error, error_capacity) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                context->candidates,
+                candidates,
+                candidate_count * sizeof(*candidates),
+                MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "上传 GPU 出生点候选种子"
+        ))
+        return -4;
+
+    blocks = (uint32_t)candidate_count;
+#if defined(MCSEED_GPU_HIP)
+    hipLaunchKernelGGL(
+        mcseed_gpu_estimate_spawn_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        context->stream,
+        context->candidates,
+        candidate_count,
+        context->spawn_config,
+        context->outer_spawn_offsets,
+        context->outer_spawn_offset_count,
+        context->inner_spawn_offsets,
+        context->inner_spawn_offset_count
+    );
+#else
+    mcseed_gpu_estimate_spawn_kernel<<<blocks, threads, 0, context->stream>>>(
+        context->candidates,
+        candidate_count,
+        context->spawn_config,
+        context->outer_spawn_offsets,
+        context->outer_spawn_offset_count,
+        context->inner_spawn_offsets,
+        context->inner_spawn_offset_count
+    );
+#endif
+    if (!mcseed_gpu_check(
+            mcseed_gpu_get_last_error(), error, error_capacity, "启动 GPU 出生点估算内核"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_memcpy_async(
+                estimates,
+                context->candidates,
+                candidate_count * sizeof(*estimates),
+                MCSEED_GPU_COPY_DEVICE_TO_HOST,
+                context->stream
+            ),
+            error,
+            error_capacity,
+            "下载 GPU 出生点估算结果"
+        ) ||
+        !mcseed_gpu_check(
+            mcseed_gpu_stream_synchronize(context->stream),
+            error,
+            error_capacity,
+            "同步 GPU 出生点估算"
+        ))
+        return -5;
     return 0;
 }

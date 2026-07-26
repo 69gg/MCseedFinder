@@ -20,8 +20,6 @@ enum {
     MCSEED_PIECE_BUFFER_CAPACITY = 1024,
     MCSEED_JIGSAW_BUFFER_CAPACITY = MCJIGSAW_PIECE_CAPACITY,
     MCSEED_TERRAIN_COLUMN_CACHE_SIZE = 256,
-    MCSEED_STRONGHOLD_COUNT = 128,
-    MCSEED_STRONGHOLD_LOCATE_MARGIN = 128,
 };
 
 enum {
@@ -770,7 +768,21 @@ int32_t mcseed_structure_gpu_config(
         return -1;
     memset(output, 0, sizeof(*output));
 
-    if (info->cubiomes_type == MCSEED_STRUCTURE_NETHER_FOSSIL) {
+    if (info->cubiomes_type == Stronghold) {
+#if MCSEED_GPU_STRONGHOLD_ALGORITHM == 1
+        if (MCSEED_CUBIOMES_VERSION <= MC_1_19_2)
+            return 0;
+        output->kind = MCSEED_GPU_PLACEMENT_STRONGHOLD;
+        output->salt = MCSEED_STRONGHOLD_COUNT;
+        output->region_size = MCSEED_STRONGHOLD_DISTANCE;
+        output->chunk_range = MCSEED_STRONGHOLD_SPREAD;
+        output->reserved = MCSEED_STRONGHOLD_LOCATE_MARGIN +
+            MCSEED_STRONGHOLD_GPU_MATH_MARGIN;
+        return 1;
+#else
+        return 0;
+#endif
+    } else if (info->cubiomes_type == MCSEED_STRUCTURE_NETHER_FOSSIL) {
         config = NETHER_FOSSIL_CONFIG;
         kind = MCSEED_GPU_PLACEMENT_FEATURE;
     } else {
@@ -820,7 +832,6 @@ int32_t mcseed_structure_gpu_config(
             kind = MCSEED_GPU_PLACEMENT_FEATURE;
             break;
         case Mineshaft:
-        case Stronghold:
         default:
             return 0;
         }
@@ -1047,6 +1058,13 @@ static int store_structure_hit(
     return 1;
 }
 
+static uint64_t stronghold_distance_bound_squared(
+    Pos position,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    int upper_bound
+);
+
 static int32_t find_strongholds(
     McSeedContext *context,
     const McSeedStructureInfo *info,
@@ -1062,14 +1080,28 @@ static int32_t find_strongholds(
 {
     Generator *generator = generator_for_dimension(context, DIM_OVERWORLD);
     StrongholdIter iterator;
+    uint64_t radius_squared = (uint64_t)radius * radius;
     uint64_t total = 0;
     int index;
     if (!generator)
         return -3;
     initFirstStronghold(&iterator, MCSEED_CUBIOMES_VERSION, context->seed);
-    for (index = 0; index < 128; index++) {
-        if (nextStronghold(&iterator, generator) <= 0)
+    for (index = 0; index < MCSEED_STRONGHOLD_COUNT; index++) {
+        const Generator *candidate_generator = generator;
+        if (MCSEED_CUBIOMES_VERSION > MC_1_19_2) {
+            uint64_t lower_bound = stronghold_distance_bound_squared(
+                iterator.nextapprox,
+                anchor_x,
+                anchor_z,
+                0
+            );
+            if (lower_bound > radius_squared)
+                candidate_generator = NULL;
+        }
+        if (nextStronghold(&iterator, candidate_generator) <= 0)
             break;
+        if (!candidate_generator)
+            continue;
         if (!within_radius(iterator.pos.x, iterator.pos.z, anchor_x, anchor_z, radius))
             continue;
         store_structure_hit(info->id, iterator.pos, hits, hit_capacity, total);

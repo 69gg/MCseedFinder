@@ -4,6 +4,7 @@
 #include "abi.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -58,6 +59,14 @@ MCSEED_GPU_INLINE uint64_t mcseed_gpu_java_next_long(uint64_t *seed)
     uint64_t high = (uint64_t)(int64_t)mcseed_gpu_java_next(seed, 32);
     uint64_t low = (uint64_t)(int64_t)mcseed_gpu_java_next(seed, 32);
     return (high << 32) + low;
+}
+
+MCSEED_GPU_INLINE double mcseed_gpu_java_next_double(uint64_t *seed)
+{
+    uint64_t value = (uint64_t)(uint32_t)mcseed_gpu_java_next(seed, 26);
+    value <<= 27;
+    value += (uint64_t)(uint32_t)mcseed_gpu_java_next(seed, 27);
+    return (double)(int64_t)value / (double)(UINT64_C(1) << 53);
 }
 
 MCSEED_GPU_INLINE McSeedGpuPosition mcseed_gpu_feature_position(
@@ -233,6 +242,95 @@ MCSEED_GPU_INLINE int mcseed_gpu_within_radius(
     return absolute_z * absolute_z <= radius_squared - absolute_x * absolute_x;
 }
 
+MCSEED_GPU_INLINE int mcseed_gpu_within_radius_envelope(
+    McSeedGpuPosition position,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    uint32_t radius,
+    uint32_t per_axis_margin
+)
+{
+    int64_t dx = (int64_t)position.x - anchor_x;
+    int64_t dz = (int64_t)position.z - anchor_z;
+    uint64_t absolute_x = dx < 0 ? (uint64_t)(-dx) : (uint64_t)dx;
+    uint64_t absolute_z = dz < 0 ? (uint64_t)(-dz) : (uint64_t)dz;
+    uint64_t bounded_x = absolute_x > per_axis_margin
+        ? absolute_x - per_axis_margin
+        : 0;
+    uint64_t bounded_z = absolute_z > per_axis_margin
+        ? absolute_z - per_axis_margin
+        : 0;
+    uint64_t radius_squared = (uint64_t)radius * radius;
+    if (bounded_x > radius || bounded_z > radius)
+        return 0;
+    return bounded_z * bounded_z <= radius_squared - bounded_x * bounded_x;
+}
+
+MCSEED_GPU_INLINE uint64_t mcseed_gpu_stronghold_potential_count(
+    const McSeedGpuStructureConfig *config,
+    uint64_t world_seed,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    uint32_t radius,
+    uint64_t limit
+)
+{
+    const double pi = 3.14159265358979323846;
+    uint64_t random;
+    double angle;
+    double distance;
+    int32_t ring_number = 0;
+    int32_t ring_index = 0;
+    int32_t ring_size;
+    int32_t index;
+    uint64_t found = 0;
+
+    if (config->salt <= 0 || config->region_size <= 0 ||
+        config->chunk_range <= 0 || config->reserved < 0 || limit == 0)
+        return 0;
+
+    random = mcseed_gpu_java_set_seed(world_seed);
+    angle = 2.0 * pi * mcseed_gpu_java_next_double(&random);
+    distance = (4.0 * config->region_size) +
+        (mcseed_gpu_java_next_double(&random) - 0.5) *
+        config->region_size * 2.5;
+    ring_size = config->chunk_range;
+
+    for (index = 0; index < config->salt; index++) {
+        McSeedGpuPosition position;
+        position.x = (int32_t)round(cos(angle) * distance) * 16 + 4;
+        position.z = (int32_t)round(sin(angle) * distance) * 16 + 4;
+        if (mcseed_gpu_within_radius_envelope(
+                position,
+                anchor_x,
+                anchor_z,
+                radius,
+                (uint32_t)config->reserved
+            )) {
+            found++;
+            if (found >= limit)
+                return found;
+        }
+
+        (void)mcseed_gpu_java_next_long(&random);
+        ring_index++;
+        angle += 2.0 * pi / ring_size;
+        if (ring_index == ring_size) {
+            ring_number++;
+            ring_index = 0;
+            ring_size += 2 * ring_size / (ring_number + 1);
+            if (ring_size > config->salt - index)
+                ring_size = config->salt - index;
+            angle += mcseed_gpu_java_next_double(&random) * pi * 2.0;
+        }
+        distance = (4.0 * config->region_size) +
+            (6.0 * ring_number * config->region_size) +
+            (mcseed_gpu_java_next_double(&random) - 0.5) *
+            config->region_size * 2.5;
+    }
+    return found;
+}
+
 MCSEED_GPU_INLINE void mcseed_gpu_resolve_anchor(
     const McSeedGpuCandidate *candidate,
     const McSeedGpuPredicate *predicate,
@@ -275,6 +373,19 @@ MCSEED_GPU_INLINE int mcseed_gpu_predicate_matches(
     for (config_index = 0; config_index < predicate->config_count; config_index++) {
         const McSeedGpuStructureConfig *config =
             &configs[predicate->config_offset + config_index];
+        if (config->kind == MCSEED_GPU_PLACEMENT_STRONGHOLD) {
+            found += mcseed_gpu_stronghold_potential_count(
+                config,
+                candidate->seed,
+                anchor_x,
+                anchor_z,
+                predicate->radius,
+                predicate->minimum - found
+            );
+            if (found >= predicate->minimum)
+                return 1;
+            continue;
+        }
         int64_t span = (int64_t)config->region_size * 16;
         int64_t region_x_min = mcseed_gpu_floor_div_i64(
             (int64_t)anchor_x - predicate->radius, span
@@ -336,6 +447,22 @@ MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
     uint32_t pair_radius;
     uint32_t left_config_index;
     McSeedGpuPosition origin = {0, 0};
+
+    /* Concentric rings do not have independent random-spread regions. */
+    for (left_config_index = 0;
+         left_config_index < predicate->left_config_count;
+         left_config_index++) {
+        if (configs[predicate->left_config_offset + left_config_index].kind ==
+            MCSEED_GPU_PLACEMENT_STRONGHOLD)
+            return 1;
+    }
+    for (left_config_index = 0;
+         left_config_index < predicate->right_config_count;
+         left_config_index++) {
+        if (configs[predicate->right_config_offset + left_config_index].kind ==
+            MCSEED_GPU_PLACEMENT_STRONGHOLD)
+            return 1;
+    }
 
     if (left_envelope_u64 > UINT32_MAX || right_envelope_u64 > UINT32_MAX ||
         pair_radius_u64 > UINT32_MAX)

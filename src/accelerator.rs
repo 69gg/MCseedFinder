@@ -8,7 +8,9 @@ use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::config::{Anchor, CompiledCondition, CompiledFilter};
-use crate::native::{self, GpuCandidate, GpuPairPredicate, GpuPredicate, GpuStructureConfig};
+use crate::native::{
+    self, GpuCandidate, GpuPairPredicate, GpuPredicate, GpuSpawnConfig, GpuStructureConfig,
+};
 
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("cuda 与 rocm feature 不能同时启用");
@@ -218,7 +220,7 @@ impl GpuPlan {
                 .checked_add(expansion)
                 .ok_or_else(|| anyhow!("GPU 粗筛半径溢出"))?;
         }
-        coarse.sort_by_key(|predicate| predicate_density_score(&self.configs, predicate));
+        coarse.sort_by_key(|predicate| predicate_order_key(&self.configs, predicate));
         self.coarse_predicates = Some(coarse);
         Ok(())
     }
@@ -226,7 +228,7 @@ impl GpuPlan {
     fn optimize_predicate_order(&mut self) {
         let configs = &self.configs;
         self.predicates
-            .sort_by_key(|predicate| predicate_density_score(configs, predicate));
+            .sort_by_key(|predicate| predicate_order_key(configs, predicate));
     }
 
     fn prepare_pre_spawn_pairs(&mut self) -> Result<()> {
@@ -249,7 +251,10 @@ impl GpuPlan {
             let anchored = self
                 .predicates
                 .iter()
-                .filter(|predicate| predicate.anchor_kind == anchor_kind)
+                .filter(|predicate| {
+                    predicate.anchor_kind == anchor_kind
+                        && predicate_supports_pair_filter(&self.configs, predicate)
+                })
                 .collect::<Vec<_>>();
             for left_index in 0..anchored.len() {
                 for right_index in left_index + 1..anchored.len() {
@@ -311,6 +316,26 @@ fn predicate_density_score(configs: &[GpuStructureConfig], predicate: &GpuPredic
     let radius = u128::from(predicate.radius);
     let minimum = u128::from(predicate.minimum.max(1));
     radius.saturating_mul(radius).saturating_mul(density) / minimum
+}
+
+fn predicate_supports_pair_filter(
+    configs: &[GpuStructureConfig],
+    predicate: &GpuPredicate,
+) -> bool {
+    let start = predicate.config_offset as usize;
+    let end = start + predicate.config_count as usize;
+    configs[start..end]
+        .iter()
+        .all(|config| config.kind != native::GPU_PLACEMENT_STRONGHOLD)
+}
+
+fn predicate_order_key(configs: &[GpuStructureConfig], predicate: &GpuPredicate) -> (bool, u128) {
+    // Concentric rings require sequential trigonometry per seed. Evaluate
+    // cheaper random-spread predicates first so most candidates short-circuit.
+    (
+        !predicate_supports_pair_filter(configs, predicate),
+        predicate_density_score(configs, predicate),
+    )
 }
 
 fn pair_left_scan_score(
@@ -444,8 +469,19 @@ impl SearchAccelerator {
                 Some(format!("无法读取设备名称，但设备初始化成功：{error:#}")),
             ),
         };
+        let spawn_config = plan
+            .needs_spawn()
+            .then(native::gpu_spawn_config)
+            .transpose()?
+            .flatten();
         let backends = match (|| -> Result<_> {
-            let backend = BackendContext::create(device, &plan.configs, &plan.predicates, &[])?;
+            let backend = BackendContext::create_with_spawn(
+                device,
+                &plan.configs,
+                &plan.predicates,
+                &[],
+                spawn_config.as_ref(),
+            )?;
             let coarse_backend = plan
                 .coarse_predicates
                 .as_ref()
@@ -521,6 +557,20 @@ impl SearchAccelerator {
         }
     }
 
+    pub const fn has_gpu_spawn_estimator(&self) -> bool {
+        match self {
+            Self::Gpu { backend, .. } => backend.has_spawn_estimator(),
+            Self::Cpu(_) => false,
+        }
+    }
+
+    pub fn estimate_spawns(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
+        match self {
+            Self::Gpu { backend, .. } => backend.estimate_spawns(candidates),
+            Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 出生点估算"),
+        }
+    }
+
     pub fn filter_pre_spawn(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<u8>> {
         match self {
             Self::Gpu {
@@ -592,6 +642,7 @@ unsafe extern "C" {
         predicate_count: usize,
         pair_predicates: *const GpuPairPredicate,
         pair_predicate_count: usize,
+        spawn_config: *const GpuSpawnConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> *mut RawBackendContext;
@@ -604,11 +655,20 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn mcseed_gpu_estimate_spawns(
+        context: *mut RawBackendContext,
+        candidates: *const GpuCandidate,
+        candidate_count: usize,
+        estimates: *mut GpuCandidate,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) struct BackendContext {
     raw: NonNull<RawBackendContext>,
+    spawn_estimator: bool,
 }
 
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
@@ -650,6 +710,16 @@ impl BackendContext {
         predicates: &[GpuPredicate],
         pair_predicates: &[GpuPairPredicate],
     ) -> Result<Self> {
+        Self::create_with_spawn(device, configs, predicates, pair_predicates, None)
+    }
+
+    fn create_with_spawn(
+        device: u32,
+        configs: &[GpuStructureConfig],
+        predicates: &[GpuPredicate],
+        pair_predicates: &[GpuPairPredicate],
+        spawn_config: Option<&GpuSpawnConfig>,
+    ) -> Result<Self> {
         let device = c_int::try_from(device).context("GPU 设备索引超出 i32")?;
         let mut error = error_buffer();
         let predicates_pointer = if predicates.is_empty() {
@@ -662,6 +732,7 @@ impl BackendContext {
         } else {
             pair_predicates.as_ptr()
         };
+        let spawn_config_pointer = spawn_config.map_or(std::ptr::null(), std::ptr::from_ref);
         let raw = unsafe {
             mcseed_gpu_context_create(
                 device,
@@ -671,13 +742,21 @@ impl BackendContext {
                 predicates.len(),
                 pair_predicates_pointer,
                 pair_predicates.len(),
+                spawn_config_pointer,
                 error.as_mut_ptr(),
                 error.len(),
             )
         };
         let raw = NonNull::new(raw)
             .ok_or_else(|| anyhow!("创建 GPU 上下文失败：{}", error_message(&error)))?;
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            spawn_estimator: spawn_config.is_some(),
+        })
+    }
+
+    const fn has_spawn_estimator(&self) -> bool {
+        self.spawn_estimator
     }
 
     fn filter(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<u8>> {
@@ -698,6 +777,33 @@ impl BackendContext {
             bail!("GPU 预筛选返回了无效布尔值");
         }
         Ok(matches)
+    }
+
+    fn estimate_spawns(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
+        if !self.spawn_estimator {
+            bail!("当前 GPU 上下文未启用出生点估算");
+        }
+        let mut estimates = candidates.to_vec();
+        let mut error = error_buffer();
+        let status = unsafe {
+            mcseed_gpu_estimate_spawns(
+                self.raw.as_ptr(),
+                candidates.as_ptr(),
+                candidates.len(),
+                estimates.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        ensure_backend_status(status, &error, "执行 GPU 出生点估算")?;
+        if estimates
+            .iter()
+            .zip(candidates)
+            .any(|(estimate, candidate)| estimate.seed != candidate.seed)
+        {
+            bail!("GPU 出生点估算改变了候选种子顺序");
+        }
+        Ok(estimates)
     }
 }
 
@@ -720,7 +826,25 @@ impl BackendContext {
         bail!("当前二进制未包含 GPU 后端")
     }
 
+    fn create_with_spawn(
+        _device: u32,
+        _configs: &[GpuStructureConfig],
+        _predicates: &[GpuPredicate],
+        _pair_predicates: &[GpuPairPredicate],
+        _spawn_config: Option<&GpuSpawnConfig>,
+    ) -> Result<Self> {
+        bail!("当前二进制未包含 GPU 后端")
+    }
+
+    const fn has_spawn_estimator(&self) -> bool {
+        false
+    }
+
     fn filter(&mut self, _candidates: &[GpuCandidate]) -> Result<Vec<u8>> {
+        bail!("当前二进制未包含 GPU 后端")
+    }
+
+    fn estimate_spawns(&mut self, _candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
         bail!("当前二进制未包含 GPU 后端")
     }
 }
@@ -764,10 +888,12 @@ mod tests {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     use super::BackendContext;
     use super::{
-        AcceleratorInfo, AcceleratorKind, GpuPlan, SearchAccelerator, pair_density_score,
-        predicate_density_score,
+        AcceleratorInfo, AcceleratorKind, GPU_ANCHOR_COORDINATES, GpuPlan, SearchAccelerator,
+        pair_density_score, predicate_density_score,
     };
     use crate::config::{CompiledFilter, conditions_from_flags};
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    use crate::native::gpu_spawn_config;
     use crate::native::{
         GpuCandidate, NativeContext, gpu_reference_filter, gpu_reference_pair_filter,
         gpu_structure_config, structure_by_name, structures,
@@ -795,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_every_random_spread_family() {
+    fn registry_exposes_every_gpu_prefilter_family() {
         let unsupported: Vec<String> = structures()
             .expect("结构注册表")
             .into_iter()
@@ -806,7 +932,7 @@ mod tests {
                     .then_some(structure.name)
             })
             .collect();
-        assert_eq!(unsupported, ["mineshaft", "stronghold"]);
+        assert_eq!(unsupported, ["mineshaft"]);
     }
 
     #[test]
@@ -822,9 +948,51 @@ mod tests {
             1_149
         );
 
-        let unsupported = filter_from_structure("village,stronghold:1024");
-        let unsupported_plan = GpuPlan::compile(&unsupported).expect("GPU 计划");
-        assert!(unsupported_plan.predicates.is_empty());
+        let combined = filter_from_structure("village,stronghold:1024");
+        let combined_plan = GpuPlan::compile(&combined).expect("GPU 计划");
+        assert_eq!(combined_plan.predicates.len(), 1);
+        assert_eq!(combined_plan.configs.len(), 2);
+        assert!(
+            combined_plan
+                .configs
+                .iter()
+                .any(|config| config.kind == crate::native::GPU_PLACEMENT_STRONGHOLD)
+        );
+    }
+
+    #[test]
+    fn stronghold_prefilter_runs_last_and_stays_out_of_pair_scans() {
+        let specifications = conditions_from_flags(
+            &[],
+            &[],
+            &[
+                "stronghold:500".to_owned(),
+                "village:100".to_owned(),
+                "ruined_portal:100".to_owned(),
+            ],
+            &[],
+            &[],
+        )
+        .expect("强要塞组合条件应可解析");
+        let filter = CompiledFilter::compile(specifications).expect("强要塞组合条件应可编译");
+        let plan = GpuPlan::compile(&filter).expect("强要塞组合 GPU 计划");
+        let is_stronghold = |predicate: &crate::native::GpuPredicate| {
+            let start = predicate.config_offset as usize;
+            let end = start + predicate.config_count as usize;
+            plan.configs[start..end]
+                .iter()
+                .any(|config| config.kind == crate::native::GPU_PLACEMENT_STRONGHOLD)
+        };
+        assert_eq!(plan.predicates.len(), 3);
+        assert!(is_stronghold(plan.predicates.last().expect("精筛条件")));
+        assert!(is_stronghold(
+            plan.coarse_predicates
+                .as_ref()
+                .expect("粗筛条件")
+                .last()
+                .expect("强要塞粗筛条件")
+        ));
+        assert_eq!(plan.pair_predicates.len(), 1);
     }
 
     #[test]
@@ -1056,6 +1224,67 @@ mod tests {
         assert!(exact_hits > 10, "样本应覆盖足够多的精确结构命中");
     }
 
+    #[test]
+    fn stronghold_envelope_never_rejects_biome_adjusted_hits() {
+        let stronghold = structure_by_name("stronghold").expect("强要塞注册项");
+        let config = gpu_structure_config(stronghold.id)
+            .expect("强要塞 GPU 配置")
+            .expect("当前版本应支持强要塞 GPU 粗筛");
+        assert_eq!(config.kind, crate::native::GPU_PLACEMENT_STRONGHOLD);
+        assert_eq!(
+            (
+                config.salt,
+                config.region_size,
+                config.chunk_range,
+                config.reserved,
+            ),
+            (128, 32, 3, 144)
+        );
+        let candidates = (-16_i64..16)
+            .map(|seed| GpuCandidate {
+                seed: seed as u64,
+                spawn_x: 0,
+                spawn_z: 0,
+            })
+            .collect::<Vec<_>>();
+        let cases = [
+            (0, 0, 3_000, 2_u64),
+            (2_000, 0, 500, 1_u64),
+            (-1_800, 800, 600, 1_u64),
+        ];
+        let mut native = NativeContext::new().expect("原生上下文");
+        let mut exact_hits = 0;
+        for (anchor_x, anchor_z, radius, minimum) in cases {
+            let predicate = crate::native::GpuPredicate {
+                config_offset: 0,
+                config_count: 1,
+                radius,
+                anchor_kind: GPU_ANCHOR_COORDINATES,
+                anchor_x,
+                anchor_z,
+                minimum,
+            };
+            let placement = gpu_reference_filter(&candidates, &[config], &[predicate]);
+            for (index, candidate) in candidates.iter().enumerate() {
+                native.set_seed(candidate.seed as i64);
+                let exact = native
+                    .find_structure(stronghold.id, anchor_x, anchor_z, radius, minimum, false)
+                    .expect("精确强要塞扫描")
+                    .found
+                    >= minimum;
+                if exact {
+                    exact_hits += 1;
+                    assert_eq!(
+                        placement[index], 1,
+                        "seed {} 的精确强要塞命中被 GPU 包络淘汰",
+                        candidate.seed as i64
+                    );
+                }
+            }
+        }
+        assert!(exact_hits >= 32, "样本应覆盖足够多的强要塞精确命中");
+    }
+
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[test]
     fn compiled_gpu_kernel_matches_all_shared_placement_algorithms_when_available() {
@@ -1115,6 +1344,28 @@ mod tests {
             "设备测试必须同时覆盖保留与淘汰"
         );
 
+        {
+            let stronghold = structure_by_name("stronghold").expect("强要塞注册项");
+            let config = gpu_structure_config(stronghold.id)
+                .expect("强要塞 GPU 配置")
+                .expect("当前版本应支持强要塞 GPU 粗筛");
+            let predicate = crate::native::GpuPredicate {
+                config_offset: 0,
+                config_count: 1,
+                radius: 500,
+                anchor_kind: GPU_ANCHOR_COORDINATES,
+                anchor_x: 2_000,
+                anchor_z: 0,
+                minimum: 1,
+            };
+            let expected = gpu_reference_filter(&candidates, &[config], &[predicate]);
+            assert!(expected.contains(&0) && expected.contains(&1));
+            let mut backend = BackendContext::create(0, &[config], &[predicate], &[])
+                .expect("创建强要塞 GPU 粗筛上下文");
+            let actual = backend.filter(&candidates).expect("执行强要塞 GPU 粗筛");
+            assert_eq!(actual, expected, "强要塞 GPU 包络与 CPU 参考不一致");
+        }
+
         let specifications = conditions_from_flags(
             &[],
             &[],
@@ -1131,6 +1382,72 @@ mod tests {
             .expect("创建 GPU 共址预筛上下文");
         let actual = backend.filter(&candidates).expect("执行 GPU 共址预筛内核");
         assert_eq!(actual, expected, "GPU 共址预筛结果与 CPU 参考实现不一致");
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    fn assert_gpu_spawn_estimator_matches_cpu(start: i64, end: i64) {
+        let Ok(device_count) = BackendContext::device_count() else {
+            return;
+        };
+        if device_count == 0 {
+            return;
+        }
+        let filter = filter_from_structure("village:128");
+        let plan = GpuPlan::compile(&filter).expect("GPU 计划");
+        let spawn_config = gpu_spawn_config()
+            .expect("GPU 出生点配置")
+            .expect("当前版本应支持 GPU 出生点估算");
+        let candidates = (start..end)
+            .map(|seed| GpuCandidate {
+                seed: seed as u64,
+                spawn_x: 0,
+                spawn_z: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut backend = BackendContext::create_with_spawn(
+            0,
+            &plan.configs,
+            &plan.predicates,
+            &[],
+            Some(&spawn_config),
+        )
+        .expect("创建 GPU 出生点上下文");
+        let gpu_started = std::time::Instant::now();
+        let actual = backend
+            .estimate_spawns(&candidates)
+            .expect("执行 GPU 出生点估算");
+        let gpu_elapsed = gpu_started.elapsed();
+        let mut native = NativeContext::new().expect("CPU 世界生成器");
+        let cpu_started = std::time::Instant::now();
+        for (candidate, estimate) in candidates.iter().zip(actual) {
+            native.set_seed(candidate.seed as i64);
+            let expected = native.estimated_spawn().expect("CPU 出生点估算");
+            assert_eq!(
+                (estimate.spawn_x, estimate.spawn_z),
+                (expected.x, expected.z),
+                "seed {} 的 GPU 出生点估算不一致",
+                candidate.seed as i64
+            );
+        }
+        eprintln!(
+            "出生点估算对照：{} seeds，GPU {:.3}s，CPU {:.3}s",
+            candidates.len(),
+            gpu_elapsed.as_secs_f64(),
+            cpu_started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    fn compiled_gpu_spawn_estimator_matches_cpu_when_available() {
+        assert_gpu_spawn_estimator_matches_cpu(-128, 128);
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    #[ignore = "有限规模 GPU/CPU 精确性验证；不纳入日常测试"]
+    fn compiled_gpu_spawn_estimator_matches_cpu_for_ten_thousand_seeds() {
+        assert_gpu_spawn_estimator_matches_cpu(0, 10_000);
     }
 
     #[test]

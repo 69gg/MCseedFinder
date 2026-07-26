@@ -2,6 +2,7 @@
 #include "finders.h"
 #include "gpu/placement.h"
 #include "jigsaw.h"
+#include "tables/btree262.h"
 #include "version.h"
 
 #include <assert.h>
@@ -26,6 +27,27 @@ typedef struct PlacementCase {
 enum {
     MCSEED_TEST_CUSTOM_PLACEMENT = -1,
 };
+
+static void assert_btree262_indices_are_in_bounds(void)
+{
+    const size_t node_count = sizeof(btree262_nodes) / sizeof(btree262_nodes[0]);
+    const size_t parameter_count = sizeof(btree262_param) / sizeof(btree262_param[0]);
+    size_t node_index;
+    assert(btree262_order == 6);
+    assert(sizeof(btree262_steps) / sizeof(btree262_steps[0]) == 6);
+    assert(btree262_steps[5] == 0);
+    assert(parameter_count <= UINT8_MAX);
+    for (node_index = 0; node_index < node_count; node_index++) {
+        uint64_t node = btree262_nodes[node_index];
+        int dimension;
+        for (dimension = 0; dimension < 6; dimension++) {
+            uint8_t parameter_index = (uint8_t)(node >> (dimension * 8));
+            assert(parameter_index < parameter_count);
+        }
+        if ((node >> 56) != UINT8_MAX)
+            assert((node >> 48) < node_count);
+    }
+}
 
 static void assert_gpu_placements_match_cubiomes(void)
 {
@@ -68,7 +90,8 @@ static void assert_gpu_placements_match_cubiomes(void)
         McSeedGpuStructureConfig config;
         int32_t structure_id = mcseed_structure_id_at(registry_index);
         assert(structure_id >= 0);
-        if (mcseed_structure_gpu_config(structure_id, &config) == 1)
+        if (mcseed_structure_gpu_config(structure_id, &config) == 1 &&
+            config.kind != MCSEED_GPU_PLACEMENT_STRONGHOLD)
             accelerated_count++;
     }
     assert(sizeof(CASES) / sizeof(CASES[0]) == accelerated_count);
@@ -138,6 +161,111 @@ static void assert_gpu_placements_match_cubiomes(void)
             (gpu_config.flags & MCSEED_GPU_PLACEMENT_END_DISTANCE) != 0)
             assert(saw_invalid);
     }
+}
+
+static int test_within_radius(
+    int32_t x,
+    int32_t z,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    uint32_t radius
+)
+{
+    int64_t dx = (int64_t)x - anchor_x;
+    int64_t dz = (int64_t)z - anchor_z;
+    uint64_t absolute_x = dx < 0 ? (uint64_t)(-dx) : (uint64_t)dx;
+    uint64_t absolute_z = dz < 0 ? (uint64_t)(-dz) : (uint64_t)dz;
+    uint64_t radius_squared = (uint64_t)radius * radius;
+    if (absolute_x > radius || absolute_z > radius)
+        return 0;
+    return absolute_z * absolute_z <= radius_squared - absolute_x * absolute_x;
+}
+
+static uint64_t brute_force_strongholds(
+    uint64_t seed,
+    int32_t anchor_x,
+    int32_t anchor_z,
+    uint32_t radius,
+    McSeedHit *hits
+)
+{
+    Generator generator;
+    StrongholdIter iterator;
+    uint64_t found = 0;
+    int index;
+    setupGenerator(&generator, MCSEED_CUBIOMES_VERSION, 0);
+    applySeed(&generator, DIM_OVERWORLD, seed);
+    initFirstStronghold(&iterator, MCSEED_CUBIOMES_VERSION, seed);
+    for (index = 0; index < MCSEED_STRONGHOLD_COUNT; index++) {
+        if (nextStronghold(&iterator, &generator) <= 0)
+            break;
+        if (!test_within_radius(
+                iterator.pos.x,
+                iterator.pos.z,
+                anchor_x,
+                anchor_z,
+                radius
+            ))
+            continue;
+        hits[found].x = iterator.pos.x;
+        hits[found].z = iterator.pos.z;
+        found++;
+    }
+    return found;
+}
+
+static void assert_pruned_stronghold_scan_matches_brute_force(int32_t stronghold_id)
+{
+    static const struct {
+        int64_t seed;
+        int32_t anchor_x;
+        int32_t anchor_z;
+        uint32_t radius;
+    } CASES[] = {
+        {0, 0, 0, 500},
+        {0, -32, 0, 2000},
+        {1, 2000, 0, 500},
+        {-1, -1800, 800, 750},
+        {INT64_C(0x0123456789abcdef), 0, 0, 3000},
+        {-INT64_C(0x0123456789abcdef), 4800, -1600, 900},
+    };
+    McSeedContext *context = mcseed_context_create();
+    size_t case_index;
+    assert(context != NULL);
+    for (case_index = 0; case_index < sizeof(CASES) / sizeof(CASES[0]); case_index++) {
+        McSeedHit expected[MCSEED_STRONGHOLD_COUNT] = {{0}};
+        McSeedHit actual[MCSEED_STRONGHOLD_COUNT] = {{0}};
+        uint64_t expected_count = brute_force_strongholds(
+            (uint64_t)CASES[case_index].seed,
+            CASES[case_index].anchor_x,
+            CASES[case_index].anchor_z,
+            CASES[case_index].radius,
+            expected
+        );
+        uint64_t actual_count = 0;
+        int32_t limit_reached = 0;
+        uint64_t hit_index;
+        mcseed_context_set_seed(context, CASES[case_index].seed);
+        assert(mcseed_find_structure(
+            context,
+            stronghold_id,
+            CASES[case_index].anchor_x,
+            CASES[case_index].anchor_z,
+            CASES[case_index].radius,
+            UINT64_MAX,
+            actual,
+            MCSEED_STRONGHOLD_COUNT,
+            &actual_count,
+            &limit_reached
+        ) == 0);
+        assert(limit_reached == 0);
+        assert(actual_count == expected_count);
+        for (hit_index = 0; hit_index < expected_count; hit_index++) {
+            assert(actual[hit_index].x == expected[hit_index].x);
+            assert(actual[hit_index].z == expected[hit_index].z);
+        }
+    }
+    mcseed_context_destroy(context);
 }
 
 static void assert_village_centers_match_cubiomes_variant(void)
@@ -210,6 +338,7 @@ int main(void)
     int32_t forest_id;
     int32_t village_id;
     int32_t shipwreck_id;
+    int32_t stronghold_id;
     int32_t treasure_id;
     int32_t fossil_id;
     int32_t limit_reached;
@@ -217,6 +346,7 @@ int main(void)
     uint32_t spawn_refinement_radius;
     uint32_t spawn_origin_radius;
 
+    assert_btree262_indices_are_in_bounds();
     assert_gpu_placements_match_cubiomes();
     assert_village_centers_match_cubiomes_variant();
     assert(mcseed_biome_count() > 50);
@@ -226,13 +356,16 @@ int main(void)
     forest_id = mcseed_biome_id_from_name("forest");
     village_id = mcseed_structure_id_from_name("village");
     shipwreck_id = mcseed_structure_id_from_name("shipwreck");
+    stronghold_id = mcseed_structure_id_from_name("stronghold");
     treasure_id = mcseed_structure_id_from_name("buried_treasure");
     fossil_id = mcseed_structure_id_from_name("nether_fossil");
     assert(forest_id >= 0);
     assert(village_id >= 0);
     assert(shipwreck_id >= 0);
+    assert(stronghold_id >= 0);
     assert(treasure_id >= 0);
     assert(fossil_id >= 0);
+    assert_pruned_stronghold_scan_matches_brute_force(stronghold_id);
     assert(mcseed_piece_selector_valid(village_id, "blacksmith"));
     assert(mcseed_piece_selector_valid(village_id, "village/plains/houses/plains_weaponsmith_1"));
     assert(mcseed_piece_selector_valid(shipwreck_id, "full"));
