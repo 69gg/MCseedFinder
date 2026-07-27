@@ -179,6 +179,8 @@ pub struct SearchOutcome {
     pub gpu_survivors: u128,
     pub gpu_pre_spawn_candidates: u128,
     pub gpu_pre_spawn_survivors: u128,
+    pub gpu_outer_coarse_candidates: u128,
+    pub gpu_outer_coarse_survivors: u128,
     pub gpu_coarse_candidates: u128,
     pub gpu_coarse_survivors: u128,
     pub gpu_timings: Option<GpuStageTimings>,
@@ -188,6 +190,8 @@ pub struct SearchOutcome {
 pub struct GpuStageTimings {
     pub candidate_preparation: Duration,
     pub pre_spawn_filter: Duration,
+    pub spawn_outer_estimation: Duration,
+    pub outer_coarse_filter: Duration,
     pub spawn_estimation: Duration,
     pub coarse_filter: Duration,
     pub spawn_refinement: Duration,
@@ -199,6 +203,8 @@ impl GpuStageTimings {
     pub fn measured(self) -> Duration {
         self.candidate_preparation
             + self.pre_spawn_filter
+            + self.spawn_outer_estimation
+            + self.outer_coarse_filter
             + self.spawn_estimation
             + self.coarse_filter
             + self.spawn_refinement
@@ -209,6 +215,8 @@ impl GpuStageTimings {
     fn accumulate(&mut self, other: Self) {
         self.candidate_preparation += other.candidate_preparation;
         self.pre_spawn_filter += other.pre_spawn_filter;
+        self.spawn_outer_estimation += other.spawn_outer_estimation;
+        self.outer_coarse_filter += other.outer_coarse_filter;
         self.spawn_estimation += other.spawn_estimation;
         self.coarse_filter += other.coarse_filter;
         self.spawn_refinement += other.spawn_refinement;
@@ -228,6 +236,7 @@ struct PreparedCandidate {
     index: u128,
     seed: i64,
     estimated_spawn: Option<Position>,
+    gpu_spawn_state: Option<u32>,
     spawn: Option<NativeSpawn>,
 }
 
@@ -365,6 +374,8 @@ struct GpuSpawnPipelineBatch {
     rejected_chunks: Vec<Vec<PreparedCandidate>>,
     pre_spawn_candidates: u128,
     pre_spawn_survivors: u128,
+    outer_coarse_candidates: u128,
+    outer_coarse_survivors: u128,
     coarse_candidates: u128,
     coarse_survivors: u128,
     timings: GpuStageTimings,
@@ -379,6 +390,7 @@ enum WorkerReply {
 struct Evaluation<'a> {
     native: &'a mut NativeContext,
     spawn: Option<SpawnInfo>,
+    end_gateway: Option<Position>,
     stronghold_portals: Vec<(i32, i32, NativePieceHit)>,
 }
 
@@ -896,6 +908,8 @@ pub fn search(
                 gpu_survivors,
                 gpu_pre_spawn_candidates,
                 gpu_pre_spawn_survivors,
+                gpu_outer_coarse_candidates: 0,
+                gpu_outer_coarse_survivors: 0,
                 gpu_coarse_candidates,
                 gpu_coarse_survivors,
                 gpu_timings: accelerator.is_gpu().then_some(gpu_timings),
@@ -935,6 +949,7 @@ fn prepare_gpu_spawn_pipeline_batch(
                 index,
                 seed: mode.seed_at(index)?,
                 estimated_spawn: None,
+                gpu_spawn_state: None,
                 spawn: None,
             })
         })
@@ -967,28 +982,60 @@ fn prepare_gpu_spawn_pipeline_batch(
         )
     };
 
+    if !accelerator.has_outer_coarse_stage() {
+        bail!("内部错误：GPU 分级出生点流水线缺少外层粗筛计划");
+    }
+
+    let outer_estimation_started = Instant::now();
+    estimate_candidate_batch_outer_on_gpu(accelerator, &mut estimation_candidates)?;
+    timings.spawn_outer_estimation += outer_estimation_started.elapsed();
+
+    let outer_coarse_started = Instant::now();
+    let outer_gpu_candidates = estimation_candidates
+        .iter()
+        .map(|candidate| candidate.gpu_candidate(SpawnPreparation::Estimate))
+        .collect::<Result<Vec<_>>>()?;
+    let outer_coarse_matches = accelerator.filter_outer_coarse(&outer_gpu_candidates)?;
+    if outer_coarse_matches.len() != estimation_candidates.len() {
+        bail!("GPU 外层出生点粗筛结果数量与候选种子数量不一致");
+    }
+    let outer_coarse_candidates = outer_coarse_matches.len() as u128;
+    let outer_coarse_survivors = outer_coarse_matches
+        .iter()
+        .map(|value| u128::from(*value))
+        .sum();
+    let outer_chunks = ordered_candidate_chunks(estimation_candidates, active_workers);
+    let (mut detailed_estimation_candidates, outer_rejected) = partition_candidates(
+        outer_chunks,
+        &outer_coarse_matches,
+        active_workers,
+        "GPU 外层出生点粗筛",
+    )?;
+    timings.outer_coarse_filter += outer_coarse_started.elapsed();
+
     let estimation_started = Instant::now();
-    estimate_candidate_batch_on_gpu(accelerator, &mut estimation_candidates)?;
+    refine_candidate_batch_on_gpu(accelerator, &mut detailed_estimation_candidates)?;
     timings.spawn_estimation += estimation_started.elapsed();
 
     let coarse_started = Instant::now();
-    let coarse_gpu_candidates = estimation_candidates
+    let coarse_gpu_candidates = detailed_estimation_candidates
         .iter()
         .map(|candidate| candidate.gpu_candidate(SpawnPreparation::Estimate))
         .collect::<Result<Vec<_>>>()?;
     let coarse_matches = accelerator.filter_coarse(&coarse_gpu_candidates)?;
-    if coarse_matches.len() != estimation_candidates.len() {
+    if coarse_matches.len() != detailed_estimation_candidates.len() {
         bail!("GPU 粗筛结果数量与候选种子数量不一致");
     }
     let coarse_candidates = coarse_matches.len() as u128;
     let coarse_survivors = coarse_matches.iter().map(|value| u128::from(*value)).sum();
-    let estimated_chunks = ordered_candidate_chunks(estimation_candidates, active_workers);
+    let estimated_chunks = ordered_candidate_chunks(detailed_estimation_candidates, active_workers);
     let (refinement_candidates, mut rejected_chunks) = partition_candidates(
         estimated_chunks,
         &coarse_matches,
         active_workers,
         "GPU 粗筛",
     )?;
+    merge_rejected_candidates(&mut rejected_chunks, outer_rejected);
     merge_rejected_candidates(&mut rejected_chunks, pre_spawn_rejected);
     timings.coarse_filter += coarse_started.elapsed();
 
@@ -1000,6 +1047,8 @@ fn prepare_gpu_spawn_pipeline_batch(
         rejected_chunks,
         pre_spawn_candidates,
         pre_spawn_survivors,
+        outer_coarse_candidates,
+        outer_coarse_survivors,
         coarse_candidates,
         coarse_survivors,
         timings,
@@ -1026,6 +1075,8 @@ fn search_gpu_spawn_pipeline(
     let mut gpu_survivors = 0_u128;
     let mut gpu_pre_spawn_candidates = 0_u128;
     let mut gpu_pre_spawn_survivors = 0_u128;
+    let mut gpu_outer_coarse_candidates = 0_u128;
+    let mut gpu_outer_coarse_survivors = 0_u128;
     let mut gpu_coarse_candidates = 0_u128;
     let mut gpu_coarse_survivors = 0_u128;
     let mut gpu_timings = GpuStageTimings::default();
@@ -1165,6 +1216,12 @@ fn search_gpu_spawn_pipeline(
         gpu_pre_spawn_survivors = gpu_pre_spawn_survivors
             .checked_add(current.pre_spawn_survivors)
             .ok_or_else(|| anyhow!("GPU 出生点前预筛保留候选数溢出"))?;
+        gpu_outer_coarse_candidates = gpu_outer_coarse_candidates
+            .checked_add(current.outer_coarse_candidates)
+            .ok_or_else(|| anyhow!("GPU 外层出生点粗筛候选数溢出"))?;
+        gpu_outer_coarse_survivors = gpu_outer_coarse_survivors
+            .checked_add(current.outer_coarse_survivors)
+            .ok_or_else(|| anyhow!("GPU 外层出生点粗筛保留候选数溢出"))?;
         gpu_coarse_candidates = gpu_coarse_candidates
             .checked_add(current.coarse_candidates)
             .ok_or_else(|| anyhow!("GPU 粗筛候选数溢出"))?;
@@ -1176,12 +1233,12 @@ fn search_gpu_spawn_pipeline(
             let rate = checked as f64 / started.elapsed().as_secs_f64().max(0.001);
             if gpu_pre_spawn_candidates > 0 {
                 eprintln!(
-                    "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 出生点前 {gpu_pre_spawn_survivors}/{gpu_pre_spawn_candidates}，粗筛 {gpu_coarse_survivors}/{gpu_coarse_candidates}，最终保留 {gpu_survivors}/{gpu_candidates_checked}",
+                    "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 出生点前 {gpu_pre_spawn_survivors}/{gpu_pre_spawn_candidates}，外层粗筛 {gpu_outer_coarse_survivors}/{gpu_outer_coarse_candidates}，精估粗筛 {gpu_coarse_survivors}/{gpu_coarse_candidates}，最终保留 {gpu_survivors}/{gpu_candidates_checked}",
                     reports.len()
                 );
             } else {
                 eprintln!(
-                    "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 粗筛 {gpu_coarse_survivors}/{gpu_coarse_candidates}，最终保留 {gpu_survivors}/{gpu_candidates_checked}",
+                    "已检查 {checked} 个种子，找到 {} 个，{rate:.0} seeds/s；GPU 外层粗筛 {gpu_outer_coarse_survivors}/{gpu_outer_coarse_candidates}，精估粗筛 {gpu_coarse_survivors}/{gpu_coarse_candidates}，最终保留 {gpu_survivors}/{gpu_candidates_checked}",
                     reports.len()
                 );
             }
@@ -1209,6 +1266,8 @@ fn search_gpu_spawn_pipeline(
         gpu_survivors,
         gpu_pre_spawn_candidates,
         gpu_pre_spawn_survivors,
+        gpu_outer_coarse_candidates,
+        gpu_outer_coarse_survivors,
         gpu_coarse_candidates,
         gpu_coarse_survivors,
         gpu_timings: Some(gpu_timings),
@@ -1268,6 +1327,7 @@ fn prepare_index_range(
             index,
             seed,
             estimated_spawn,
+            gpu_spawn_state: None,
             spawn,
         });
     }
@@ -1334,12 +1394,57 @@ fn estimate_candidate_batch_on_gpu(
         .map(|candidate| candidate.gpu_candidate(SpawnPreparation::None))
         .collect::<Result<Vec<_>>>()?;
     let estimates = accelerator.estimate_spawns(&gpu_candidates)?;
+    apply_gpu_spawn_estimates(candidates, estimates, "GPU 出生点估算")
+}
+
+fn estimate_candidate_batch_outer_on_gpu(
+    accelerator: &mut SearchAccelerator,
+    candidates: &mut [PreparedCandidate],
+) -> Result<()> {
+    let gpu_candidates = candidates
+        .iter()
+        .map(|candidate| candidate.gpu_candidate(SpawnPreparation::None))
+        .collect::<Result<Vec<_>>>()?;
+    let estimates = accelerator.estimate_spawn_outer(&gpu_candidates)?;
+    apply_gpu_spawn_estimates(candidates, estimates, "GPU 外层出生点估算")?;
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.gpu_spawn_state =
+            Some(u32::try_from(index).context("GPU 外层出生点状态索引超出 u32")?);
+    }
+    Ok(())
+}
+
+fn refine_candidate_batch_on_gpu(
+    accelerator: &mut SearchAccelerator,
+    candidates: &mut [PreparedCandidate],
+) -> Result<()> {
+    let gpu_candidates = candidates
+        .iter()
+        .map(|candidate| candidate.gpu_candidate(SpawnPreparation::Estimate))
+        .collect::<Result<Vec<_>>>()?;
+    let state_indices = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .gpu_spawn_state
+                .ok_or_else(|| anyhow!("GPU 内层出生点候选缺少缓存状态索引"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let estimates = accelerator.refine_spawn_estimates(&gpu_candidates, &state_indices)?;
+    apply_gpu_spawn_estimates(candidates, estimates, "GPU 内层出生点细化")
+}
+
+fn apply_gpu_spawn_estimates(
+    candidates: &mut [PreparedCandidate],
+    estimates: Vec<GpuCandidate>,
+    stage: &str,
+) -> Result<()> {
     if estimates.len() != candidates.len() {
-        bail!("GPU 出生点估算结果数量与候选种子数量不一致");
+        bail!("{stage}结果数量与候选种子数量不一致");
     }
     for (candidate, estimate) in candidates.iter_mut().zip(estimates) {
         if estimate.seed != candidate.seed as u64 {
-            bail!("GPU 出生点估算结果与候选种子顺序不一致");
+            bail!("{stage}结果与候选种子顺序不一致");
         }
         candidate.estimated_spawn = Some(Position {
             x: estimate.spawn_x,
@@ -1454,6 +1559,7 @@ impl<'a> Evaluation<'a> {
         Self {
             native,
             spawn,
+            end_gateway: None,
             stronghold_portals: Vec::new(),
         }
     }
@@ -1786,6 +1892,15 @@ impl<'a> Evaluation<'a> {
         Ok(hit)
     }
 
+    fn first_end_gateway_exit(&mut self) -> Result<Position> {
+        if let Some(position) = self.end_gateway {
+            return Ok(position);
+        }
+        let position = self.native.first_end_gateway_exit()?;
+        self.end_gateway = Some(position);
+        Ok(position)
+    }
+
     fn resolve_anchor(&mut self, anchor: Anchor) -> Result<(i32, i32)> {
         match anchor {
             Anchor::Origin => Ok((0, 0)),
@@ -1800,6 +1915,10 @@ impl<'a> Evaluation<'a> {
                     project_to_nether(spawn.position.x),
                     project_to_nether(spawn.position.z),
                 ))
+            }
+            Anchor::EndGateway => {
+                let exit = self.first_end_gateway_exit()?;
+                Ok((exit.x, exit.z))
             }
         }
     }
@@ -1882,6 +2001,7 @@ mod tests {
                 y: None,
                 z: -40,
             }),
+            gpu_spawn_state: None,
             spawn: None,
         };
         let estimated = candidate
@@ -1915,6 +2035,7 @@ mod tests {
                 index,
                 seed: index as i64,
                 estimated_spawn: None,
+                gpu_spawn_state: None,
                 spawn: None,
             })
             .collect::<Vec<_>>();
@@ -2046,6 +2167,7 @@ mod tests {
                 index,
                 seed: index as i64,
                 estimated_spawn: None,
+                gpu_spawn_state: None,
                 spawn: None,
             })
             .collect::<Vec<_>>();

@@ -24,7 +24,15 @@ const GPU_ANCHOR_ORIGIN: i32 = 0;
 const GPU_ANCHOR_SPAWN: i32 = 1;
 const GPU_ANCHOR_NETHER_SPAWN: i32 = 2;
 const GPU_ANCHOR_COORDINATES: i32 = 3;
+const GPU_ANCHOR_END_GATEWAY: i32 = 4;
 const GPU_DENSITY_SCALE: u128 = 1_u128 << 64;
+const GPU_PAIR_GROUPED: u32 = 1 << 31;
+const GPU_PAIR_ANCHOR_SPAWN: u32 = 1 << 30;
+const GPU_PAIR_ANCHOR_NETHER_SPAWN: u32 = 1 << 29;
+const GPU_PAIR_SHIFT_MASK: u32 = 31;
+const GPU_NETHER_COORDINATE_SHIFT: u32 = 3;
+const GPU_OUTER_GROUPED_PAIR_MIN_PREDICATES: usize = 2;
+const GPU_GROUPED_PAIR_MIN_PREDICATES: usize = 5;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +98,9 @@ pub struct GpuPlan {
     pub(crate) configs: Vec<GpuStructureConfig>,
     pub(crate) predicates: Vec<GpuPredicate>,
     coarse_predicates: Option<Vec<GpuPredicate>>,
+    outer_coarse_predicates: Option<Vec<GpuPredicate>>,
+    outer_pair_predicates: Vec<GpuPairPredicate>,
+    pre_spawn_predicates: Vec<GpuPredicate>,
     pair_predicates: Vec<GpuPairPredicate>,
     needs_spawn: bool,
 }
@@ -100,13 +111,17 @@ impl GpuPlan {
             configs: Vec::new(),
             predicates: Vec::new(),
             coarse_predicates: None,
+            outer_coarse_predicates: None,
+            outer_pair_predicates: Vec::new(),
+            pre_spawn_predicates: Vec::new(),
             pair_predicates: Vec::new(),
             needs_spawn: false,
         };
         plan.collect_required(&filter.root)?;
         plan.optimize_predicate_order();
         plan.prepare_coarse_predicates()?;
-        plan.prepare_pre_spawn_pairs()?;
+        plan.prepare_outer_coarse_predicates()?;
+        plan.prepare_pre_spawn_filter()?;
         Ok(plan)
     }
 
@@ -162,6 +177,27 @@ impl GpuPlan {
         radius: u32,
         minimum: u64,
     ) -> Result<()> {
+        let (anchor_kind, anchor_x, anchor_z, radius) = match anchor {
+            Anchor::Origin => (GPU_ANCHOR_ORIGIN, 0, 0, radius),
+            Anchor::Spawn => {
+                self.needs_spawn = true;
+                (GPU_ANCHOR_SPAWN, 0, 0, radius)
+            }
+            Anchor::NetherSpawn => {
+                self.needs_spawn = true;
+                (GPU_ANCHOR_NETHER_SPAWN, 0, 0, radius)
+            }
+            Anchor::EndGateway => {
+                let Some(margin) = native::end_gateway_gpu_margin()? else {
+                    return Ok(());
+                };
+                let radius = radius
+                    .checked_add(margin)
+                    .ok_or_else(|| anyhow!("末地折跃门 GPU 包络半径溢出"))?;
+                (GPU_ANCHOR_END_GATEWAY, 0, 0, radius)
+            }
+            Anchor::Coordinates { x, z } => (GPU_ANCHOR_COORDINATES, x, z, radius),
+        };
         let offset = u32::try_from(self.configs.len()).context("GPU 结构配置数量超出 u32")?;
         self.configs.extend(configs);
         let end = u32::try_from(self.configs.len()).context("GPU 结构配置数量超出 u32")?;
@@ -171,18 +207,6 @@ impl GpuPlan {
         if count == 0 {
             bail!("内部错误：GPU 预筛选条件没有结构配置");
         }
-        let (anchor_kind, anchor_x, anchor_z) = match anchor {
-            Anchor::Origin => (GPU_ANCHOR_ORIGIN, 0, 0),
-            Anchor::Spawn => {
-                self.needs_spawn = true;
-                (GPU_ANCHOR_SPAWN, 0, 0)
-            }
-            Anchor::NetherSpawn => {
-                self.needs_spawn = true;
-                (GPU_ANCHOR_NETHER_SPAWN, 0, 0)
-            }
-            Anchor::Coordinates { x, z } => (GPU_ANCHOR_COORDINATES, x, z),
-        };
         self.predicates.push(GpuPredicate {
             config_offset: offset,
             config_count: count,
@@ -209,19 +233,50 @@ impl GpuPlan {
             .checked_add(2)
             .ok_or_else(|| anyhow!("下界出生点细化半径溢出"))?;
         let mut coarse = self.predicates.clone();
-        for predicate in &mut coarse {
-            let expansion = match predicate.anchor_kind {
-                GPU_ANCHOR_SPAWN => spawn_radius,
-                GPU_ANCHOR_NETHER_SPAWN => nether_radius,
-                _ => 0,
-            };
-            predicate.radius = predicate
-                .radius
-                .checked_add(expansion)
-                .ok_or_else(|| anyhow!("GPU 粗筛半径溢出"))?;
-        }
+        expand_spawn_predicates(&mut coarse, spawn_radius, nether_radius, "GPU 粗筛")?;
         coarse.sort_by_key(|predicate| predicate_order_key(&self.configs, predicate));
         self.coarse_predicates = Some(coarse);
+        Ok(())
+    }
+
+    fn prepare_outer_coarse_predicates(&mut self) -> Result<()> {
+        if self.coarse_predicates.is_none() {
+            return Ok(());
+        }
+        let Some(config) = native::gpu_spawn_config()? else {
+            return Ok(());
+        };
+        let Some(refinement_radius) = native::spawn_refinement_radius()? else {
+            return Ok(());
+        };
+        let spawn_radius = config
+            .inner_radius
+            .checked_add(config.output_rounding_radius)
+            .and_then(|radius| radius.checked_add(refinement_radius))
+            .ok_or_else(|| anyhow!("GPU 外层出生点包络半径溢出"))?;
+        let nether_radius = spawn_radius
+            .div_ceil(8)
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("GPU 外层下界出生点包络半径溢出"))?;
+        let mut predicates = self.predicates.clone();
+        expand_spawn_predicates(&mut predicates, spawn_radius, nether_radius, "GPU 外层粗筛")?;
+        predicates.sort_by_key(|predicate| predicate_order_key(&self.configs, predicate));
+        self.outer_pair_predicates = build_same_anchor_pairs(
+            &self.configs,
+            &self.predicates,
+            spawn_radius,
+            nether_radius,
+            true,
+        );
+        append_grouped_cross_dimension_pairs(
+            &mut self.outer_pair_predicates,
+            &self.configs,
+            &self.predicates,
+            spawn_radius,
+            GPU_OUTER_GROUPED_PAIR_MIN_PREDICATES,
+            true,
+        );
+        self.outer_coarse_predicates = Some(predicates);
         Ok(())
     }
 
@@ -231,7 +286,7 @@ impl GpuPlan {
             .sort_by_key(|predicate| predicate_order_key(configs, predicate));
     }
 
-    fn prepare_pre_spawn_pairs(&mut self) -> Result<()> {
+    fn prepare_pre_spawn_filter(&mut self) -> Result<()> {
         if self.coarse_predicates.is_none() {
             return Ok(());
         }
@@ -244,45 +299,45 @@ impl GpuPlan {
             .checked_add(2)
             .ok_or_else(|| anyhow!("下界出生点原点半径溢出"))?;
 
-        for (anchor_kind, anchor_radius) in [
-            (GPU_ANCHOR_SPAWN, spawn_radius),
-            (GPU_ANCHOR_NETHER_SPAWN, nether_radius),
-        ] {
-            let anchored = self
-                .predicates
-                .iter()
-                .filter(|predicate| {
-                    predicate.anchor_kind == anchor_kind
-                        && predicate_supports_pair_filter(&self.configs, predicate)
-                })
-                .collect::<Vec<_>>();
-            for left_index in 0..anchored.len() {
-                for right_index in left_index + 1..anchored.len() {
-                    let left = anchored[left_index];
-                    let right = anchored[right_index];
-                    let mut pair = GpuPairPredicate {
-                        left_config_offset: left.config_offset,
-                        left_config_count: left.config_count,
-                        right_config_offset: right.config_offset,
-                        right_config_count: right.config_count,
-                        left_radius: left.radius,
-                        right_radius: right.radius,
-                        anchor_radius,
-                        reserved: 0,
-                    };
-                    if pair_left_scan_score(&self.configs, &pair, false)
-                        > pair_left_scan_score(&self.configs, &pair, true)
-                    {
-                        std::mem::swap(&mut pair.left_config_offset, &mut pair.right_config_offset);
-                        std::mem::swap(&mut pair.left_config_count, &mut pair.right_config_count);
-                        std::mem::swap(&mut pair.left_radius, &mut pair.right_radius);
-                    }
-                    self.pair_predicates.push(pair);
+        self.pre_spawn_predicates = self.predicates.clone();
+        for predicate in &mut self.pre_spawn_predicates {
+            match predicate.anchor_kind {
+                GPU_ANCHOR_SPAWN => {
+                    predicate.anchor_kind = GPU_ANCHOR_ORIGIN;
+                    predicate.radius = predicate
+                        .radius
+                        .checked_add(spawn_radius)
+                        .ok_or_else(|| anyhow!("出生点前主世界结构包络半径溢出"))?;
                 }
+                GPU_ANCHOR_NETHER_SPAWN => {
+                    predicate.anchor_kind = GPU_ANCHOR_ORIGIN;
+                    predicate.radius = predicate
+                        .radius
+                        .checked_add(nether_radius)
+                        .ok_or_else(|| anyhow!("出生点前下界结构包络半径溢出"))?;
+                }
+                _ => {}
             }
         }
-        self.pair_predicates
-            .sort_by_key(|predicate| pair_density_score(&self.configs, predicate));
+        self.pre_spawn_predicates
+            .sort_by_key(|predicate| predicate_order_key(&self.configs, predicate));
+
+        self.pair_predicates = build_same_anchor_pairs(
+            &self.configs,
+            &self.predicates,
+            spawn_radius,
+            nether_radius,
+            false,
+        );
+
+        append_grouped_cross_dimension_pairs(
+            &mut self.pair_predicates,
+            &self.configs,
+            &self.predicates,
+            spawn_radius,
+            GPU_GROUPED_PAIR_MIN_PREDICATES,
+            false,
+        );
         Ok(())
     }
 
@@ -294,8 +349,159 @@ impl GpuPlan {
         self.coarse_predicates.is_some()
     }
 
+    pub const fn has_outer_coarse_stage(&self) -> bool {
+        self.outer_coarse_predicates.is_some()
+    }
+
     pub const fn has_pre_spawn_stage(&self) -> bool {
-        !self.pair_predicates.is_empty()
+        !self.pre_spawn_predicates.is_empty() || !self.pair_predicates.is_empty()
+    }
+}
+
+fn expand_spawn_predicates(
+    predicates: &mut [GpuPredicate],
+    spawn_radius: u32,
+    nether_radius: u32,
+    stage: &str,
+) -> Result<()> {
+    for predicate in predicates {
+        let expansion = match predicate.anchor_kind {
+            GPU_ANCHOR_SPAWN => spawn_radius,
+            GPU_ANCHOR_NETHER_SPAWN => nether_radius,
+            _ => 0,
+        };
+        predicate.radius = predicate
+            .radius
+            .checked_add(expansion)
+            .ok_or_else(|| anyhow!("{stage}半径溢出"))?;
+    }
+    Ok(())
+}
+
+fn build_same_anchor_pairs(
+    configs: &[GpuStructureConfig],
+    predicates: &[GpuPredicate],
+    spawn_radius: u32,
+    nether_radius: u32,
+    candidate_relative: bool,
+) -> Vec<GpuPairPredicate> {
+    let mut pairs = Vec::new();
+    for (anchor_kind, anchor_radius, candidate_anchor_flag) in [
+        (GPU_ANCHOR_SPAWN, spawn_radius, GPU_PAIR_ANCHOR_SPAWN),
+        (
+            GPU_ANCHOR_NETHER_SPAWN,
+            nether_radius,
+            GPU_PAIR_ANCHOR_NETHER_SPAWN,
+        ),
+    ] {
+        let anchored = predicates
+            .iter()
+            .filter(|predicate| {
+                predicate.anchor_kind == anchor_kind
+                    && predicate_supports_pair_filter(configs, predicate)
+            })
+            .collect::<Vec<_>>();
+        for left_index in 0..anchored.len() {
+            for right_index in left_index + 1..anchored.len() {
+                let left = anchored[left_index];
+                let right = anchored[right_index];
+                let mut pair = GpuPairPredicate {
+                    left_config_offset: left.config_offset,
+                    left_config_count: left.config_count,
+                    right_config_offset: right.config_offset,
+                    right_config_count: right.config_count,
+                    left_radius: left.radius,
+                    right_radius: right.radius,
+                    anchor_radius,
+                    left_coordinate_shift: if candidate_relative {
+                        candidate_anchor_flag
+                    } else {
+                        0
+                    },
+                };
+                if pair_left_scan_score(configs, &pair, false)
+                    > pair_left_scan_score(configs, &pair, true)
+                {
+                    std::mem::swap(&mut pair.left_config_offset, &mut pair.right_config_offset);
+                    std::mem::swap(&mut pair.left_config_count, &mut pair.right_config_count);
+                    std::mem::swap(&mut pair.left_radius, &mut pair.right_radius);
+                }
+                pairs.push(pair);
+            }
+        }
+    }
+    pairs.sort_by_key(|predicate| pair_density_score(configs, predicate));
+    pairs
+}
+
+fn append_grouped_cross_dimension_pairs(
+    pairs: &mut Vec<GpuPairPredicate>,
+    configs: &[GpuStructureConfig],
+    predicates: &[GpuPredicate],
+    spawn_radius: u32,
+    minimum_predicates: usize,
+    candidate_relative: bool,
+) {
+    let overworld = predicates
+        .iter()
+        .filter(|predicate| {
+            predicate.anchor_kind == GPU_ANCHOR_SPAWN
+                && predicate_supports_pair_filter(configs, predicate)
+        })
+        .collect::<Vec<_>>();
+    let nether = predicates
+        .iter()
+        .filter(|predicate| {
+            predicate.anchor_kind == GPU_ANCHOR_NETHER_SPAWN
+                && predicate_supports_pair_filter(configs, predicate)
+        })
+        .collect::<Vec<_>>();
+    if overworld.is_empty()
+        || nether.is_empty()
+        || overworld.len() + nether.len() < minimum_predicates
+    {
+        return;
+    }
+    let Some(pivot) = overworld
+        .iter()
+        .min_by_key(|predicate| predicate_anchor_scan_score(configs, predicate, spawn_radius))
+        .copied()
+    else {
+        return;
+    };
+    let flags = GPU_PAIR_GROUPED
+        | if candidate_relative {
+            GPU_PAIR_ANCHOR_SPAWN
+        } else {
+            0
+        };
+    for right in overworld
+        .iter()
+        .copied()
+        .filter(|predicate| !std::ptr::eq(*predicate, pivot))
+    {
+        pairs.push(GpuPairPredicate {
+            left_config_offset: pivot.config_offset,
+            left_config_count: pivot.config_count,
+            right_config_offset: right.config_offset,
+            right_config_count: right.config_count,
+            left_radius: pivot.radius,
+            right_radius: right.radius,
+            anchor_radius: spawn_radius,
+            left_coordinate_shift: flags,
+        });
+    }
+    for right in nether.iter().copied() {
+        pairs.push(GpuPairPredicate {
+            left_config_offset: pivot.config_offset,
+            left_config_count: pivot.config_count,
+            right_config_offset: right.config_offset,
+            right_config_count: right.config_count,
+            left_radius: pivot.radius,
+            right_radius: right.radius,
+            anchor_radius: spawn_radius,
+            left_coordinate_shift: flags | GPU_NETHER_COORDINATE_SHIFT,
+        });
     }
 }
 
@@ -362,10 +568,31 @@ fn pair_left_scan_score(
         .saturating_mul(config_density(configs, offset, count))
 }
 
+fn predicate_anchor_scan_score(
+    configs: &[GpuStructureConfig],
+    predicate: &GpuPredicate,
+    anchor_radius: u32,
+) -> u128 {
+    let envelope = u128::from(anchor_radius) + u128::from(predicate.radius);
+    envelope
+        .saturating_mul(envelope)
+        .saturating_mul(config_density(
+            configs,
+            predicate.config_offset,
+            predicate.config_count,
+        ))
+}
+
 fn pair_density_score(configs: &[GpuStructureConfig], predicate: &GpuPairPredicate) -> u128 {
     // 期望共址对数量与左侧原点包络面积、右侧相对搜索面积及两侧密度的乘积成正比。
     let left_envelope = u128::from(predicate.anchor_radius) + u128::from(predicate.left_radius);
-    let pair_radius = u128::from(predicate.left_radius) + u128::from(predicate.right_radius);
+    let shift = predicate.left_coordinate_shift & GPU_PAIR_SHIFT_MASK;
+    let scale = 1_u128 << shift;
+    let pair_radius = if shift == 0 {
+        u128::from(predicate.left_radius) + u128::from(predicate.right_radius)
+    } else {
+        u128::from(predicate.left_radius).div_ceil(scale) + u128::from(predicate.right_radius) + 2
+    };
     let left_candidates = left_envelope
         .saturating_mul(left_envelope)
         .saturating_mul(config_density(
@@ -389,9 +616,10 @@ pub enum SearchAccelerator {
     Cpu(AcceleratorInfo),
     Gpu {
         info: AcceleratorInfo,
-        plan: GpuPlan,
+        plan: Box<GpuPlan>,
         backend: BackendContext,
         coarse_backend: Option<BackendContext>,
+        outer_coarse_backend: Option<BackendContext>,
         pre_spawn_backend: Option<BackendContext>,
     },
 }
@@ -487,10 +715,35 @@ impl SearchAccelerator {
                 .as_ref()
                 .map(|predicates| BackendContext::create(device, &plan.configs, predicates, &[]))
                 .transpose()?;
-            let pre_spawn_backend = (!plan.pair_predicates.is_empty())
-                .then(|| BackendContext::create(device, &plan.configs, &[], &plan.pair_predicates))
+            let outer_coarse_backend = plan
+                .outer_coarse_predicates
+                .as_ref()
+                .map(|predicates| {
+                    BackendContext::create(
+                        device,
+                        &plan.configs,
+                        predicates,
+                        &plan.outer_pair_predicates,
+                    )
+                })
                 .transpose()?;
-            Ok((backend, coarse_backend, pre_spawn_backend))
+            let pre_spawn_backend = plan
+                .has_pre_spawn_stage()
+                .then(|| {
+                    BackendContext::create(
+                        device,
+                        &plan.configs,
+                        &plan.pre_spawn_predicates,
+                        &plan.pair_predicates,
+                    )
+                })
+                .transpose()?;
+            Ok((
+                backend,
+                coarse_backend,
+                outer_coarse_backend,
+                pre_spawn_backend,
+            ))
         })() {
             Ok(backends) => backends,
             Err(error) if requested == AcceleratorKind::Auto => {
@@ -509,10 +762,11 @@ impl SearchAccelerator {
                 note: device_note,
                 predicate_count: plan.predicates.len() + plan.pair_predicates.len(),
             },
-            plan,
+            plan: Box::new(plan),
             backend: backends.0,
             coarse_backend: backends.1,
-            pre_spawn_backend: backends.2,
+            outer_coarse_backend: backends.2,
+            pre_spawn_backend: backends.3,
         })
     }
 
@@ -557,6 +811,13 @@ impl SearchAccelerator {
         }
     }
 
+    pub const fn has_outer_coarse_stage(&self) -> bool {
+        match self {
+            Self::Gpu { plan, .. } => plan.has_outer_coarse_stage(),
+            Self::Cpu(_) => false,
+        }
+    }
+
     pub const fn has_gpu_spawn_estimator(&self) -> bool {
         match self {
             Self::Gpu { backend, .. } => backend.has_spawn_estimator(),
@@ -568,6 +829,27 @@ impl SearchAccelerator {
         match self {
             Self::Gpu { backend, .. } => backend.estimate_spawns(candidates),
             Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 出生点估算"),
+        }
+    }
+
+    pub fn estimate_spawn_outer(
+        &mut self,
+        candidates: &[GpuCandidate],
+    ) -> Result<Vec<GpuCandidate>> {
+        match self {
+            Self::Gpu { backend, .. } => backend.estimate_spawn_outer(candidates),
+            Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 外层出生点估算"),
+        }
+    }
+
+    pub fn refine_spawn_estimates(
+        &mut self,
+        candidates: &[GpuCandidate],
+        state_indices: &[u32],
+    ) -> Result<Vec<GpuCandidate>> {
+        match self {
+            Self::Gpu { backend, .. } => backend.refine_spawn_estimates(candidates, state_indices),
+            Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 内层出生点细化"),
         }
     }
 
@@ -590,6 +872,17 @@ impl SearchAccelerator {
             } => backend.filter(candidates),
             Self::Gpu { .. } => bail!("内部错误：当前 GPU 计划没有出生点粗筛阶段"),
             Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 出生点粗筛"),
+        }
+    }
+
+    pub fn filter_outer_coarse(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<u8>> {
+        match self {
+            Self::Gpu {
+                outer_coarse_backend: Some(backend),
+                ..
+            } => backend.filter(candidates),
+            Self::Gpu { .. } => bail!("内部错误：当前 GPU 计划没有外层出生点粗筛阶段"),
+            Self::Cpu(_) => bail!("内部错误：CPU 搜索调用了 GPU 外层出生点粗筛"),
         }
     }
 
@@ -658,6 +951,23 @@ unsafe extern "C" {
     fn mcseed_gpu_estimate_spawns(
         context: *mut RawBackendContext,
         candidates: *const GpuCandidate,
+        candidate_count: usize,
+        estimates: *mut GpuCandidate,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn mcseed_gpu_estimate_spawn_outer(
+        context: *mut RawBackendContext,
+        candidates: *const GpuCandidate,
+        candidate_count: usize,
+        estimates: *mut GpuCandidate,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn mcseed_gpu_refine_cached_spawn_estimates(
+        context: *mut RawBackendContext,
+        candidates: *const GpuCandidate,
+        state_indices: *const u32,
         candidate_count: usize,
         estimates: *mut GpuCandidate,
         error: *mut c_char,
@@ -780,13 +1090,76 @@ impl BackendContext {
     }
 
     fn estimate_spawns(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
+        self.run_spawn_estimator(
+            candidates,
+            mcseed_gpu_estimate_spawns,
+            "执行 GPU 出生点估算",
+        )
+    }
+
+    fn estimate_spawn_outer(&mut self, candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
+        self.run_spawn_estimator(
+            candidates,
+            mcseed_gpu_estimate_spawn_outer,
+            "执行 GPU 外层出生点估算",
+        )
+    }
+
+    fn refine_spawn_estimates(
+        &mut self,
+        candidates: &[GpuCandidate],
+        state_indices: &[u32],
+    ) -> Result<Vec<GpuCandidate>> {
+        if !self.spawn_estimator {
+            bail!("当前 GPU 上下文未启用出生点估算");
+        }
+        if candidates.len() != state_indices.len() {
+            bail!("GPU 内层出生点候选数与缓存状态索引数不一致");
+        }
+        let mut estimates = candidates.to_vec();
+        let mut error = error_buffer();
+        let status = unsafe {
+            mcseed_gpu_refine_cached_spawn_estimates(
+                self.raw.as_ptr(),
+                candidates.as_ptr(),
+                state_indices.as_ptr(),
+                candidates.len(),
+                estimates.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        ensure_backend_status(status, &error, "执行 GPU 内层出生点细化")?;
+        if estimates
+            .iter()
+            .zip(candidates)
+            .any(|(estimate, candidate)| estimate.seed != candidate.seed)
+        {
+            bail!("GPU 内层出生点细化改变了候选种子顺序");
+        }
+        Ok(estimates)
+    }
+
+    fn run_spawn_estimator(
+        &mut self,
+        candidates: &[GpuCandidate],
+        estimator: unsafe extern "C" fn(
+            *mut RawBackendContext,
+            *const GpuCandidate,
+            usize,
+            *mut GpuCandidate,
+            *mut c_char,
+            usize,
+        ) -> c_int,
+        operation: &str,
+    ) -> Result<Vec<GpuCandidate>> {
         if !self.spawn_estimator {
             bail!("当前 GPU 上下文未启用出生点估算");
         }
         let mut estimates = candidates.to_vec();
         let mut error = error_buffer();
         let status = unsafe {
-            mcseed_gpu_estimate_spawns(
+            estimator(
                 self.raw.as_ptr(),
                 candidates.as_ptr(),
                 candidates.len(),
@@ -795,13 +1168,13 @@ impl BackendContext {
                 error.len(),
             )
         };
-        ensure_backend_status(status, &error, "执行 GPU 出生点估算")?;
+        ensure_backend_status(status, &error, operation)?;
         if estimates
             .iter()
             .zip(candidates)
             .any(|(estimate, candidate)| estimate.seed != candidate.seed)
         {
-            bail!("GPU 出生点估算改变了候选种子顺序");
+            bail!("{operation}改变了候选种子顺序");
         }
         Ok(estimates)
     }
@@ -847,6 +1220,18 @@ impl BackendContext {
     fn estimate_spawns(&mut self, _candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
         bail!("当前二进制未包含 GPU 后端")
     }
+
+    fn estimate_spawn_outer(&mut self, _candidates: &[GpuCandidate]) -> Result<Vec<GpuCandidate>> {
+        bail!("当前二进制未包含 GPU 后端")
+    }
+
+    fn refine_spawn_estimates(
+        &mut self,
+        _candidates: &[GpuCandidate],
+        _state_indices: &[u32],
+    ) -> Result<Vec<GpuCandidate>> {
+        bail!("当前二进制未包含 GPU 后端")
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -888,8 +1273,10 @@ mod tests {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     use super::BackendContext;
     use super::{
-        AcceleratorInfo, AcceleratorKind, GPU_ANCHOR_COORDINATES, GpuPlan, SearchAccelerator,
-        pair_density_score, predicate_density_score,
+        AcceleratorInfo, AcceleratorKind, GPU_ANCHOR_COORDINATES, GPU_ANCHOR_END_GATEWAY,
+        GPU_NETHER_COORDINATE_SHIFT, GPU_PAIR_ANCHOR_NETHER_SPAWN, GPU_PAIR_ANCHOR_SPAWN,
+        GPU_PAIR_GROUPED, GPU_PAIR_SHIFT_MASK, GpuPlan, SearchAccelerator, pair_density_score,
+        predicate_density_score,
     };
     use crate::config::{CompiledFilter, conditions_from_flags};
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -943,10 +1330,16 @@ mod tests {
         assert_eq!(plan.configs.len(), 1);
         assert!(plan.needs_spawn());
         assert!(plan.has_coarse_stage());
+        assert!(plan.has_outer_coarse_stage());
         assert_eq!(
             plan.coarse_predicates.as_ref().expect("粗筛条件")[0].radius,
             1_149
         );
+        assert_eq!(
+            plan.outer_coarse_predicates.as_ref().expect("外层粗筛条件")[0].radius,
+            1_673
+        );
+        assert_eq!(plan.pre_spawn_predicates[0].radius, 3_721);
 
         let combined = filter_from_structure("village,stronghold:1024");
         let combined_plan = GpuPlan::compile(&combined).expect("GPU 计划");
@@ -958,6 +1351,41 @@ mod tests {
                 .iter()
                 .any(|config| config.kind == crate::native::GPU_PLACEMENT_STRONGHOLD)
         );
+    }
+
+    #[test]
+    fn end_gateway_plan_uses_a_conservative_seed_dependent_anchor() {
+        let filter = filter_from_structure("end_city:500");
+        let plan = GpuPlan::compile(&filter).expect("末地折跃门 GPU 计划");
+        assert_eq!(plan.predicates.len(), 1);
+        assert_eq!(plan.predicates[0].anchor_kind, GPU_ANCHOR_END_GATEWAY);
+        assert_eq!(plan.predicates[0].radius, 820);
+        assert!(!plan.needs_spawn());
+        assert!(!plan.has_coarse_stage());
+
+        let mut native = NativeContext::new().expect("末地生成器");
+        let mut exact_hits = 0;
+        for seed in 0_i64..16 {
+            native.set_seed(seed);
+            let exit = native.first_end_gateway_exit().expect("外岛折跃门出口");
+            let end_city = structure_by_name("end_city").expect("末地城注册项");
+            let exact = native
+                .find_structure(end_city.id, exit.x, exit.z, 500, 1, false)
+                .expect("精确末地城扫描")
+                .found
+                > 0;
+            let candidate = GpuCandidate {
+                seed: seed as u64,
+                spawn_x: 0,
+                spawn_z: 0,
+            };
+            let retained = gpu_reference_filter(&[candidate], &plan.configs, &plan.predicates)[0];
+            if exact {
+                exact_hits += 1;
+                assert_eq!(retained, 1, "seed {seed} 的末地城命中被折跃门包络淘汰");
+            }
+        }
+        assert!(exact_hits > 0, "样本应覆盖末地城精确命中");
     }
 
     #[test]
@@ -1041,21 +1469,73 @@ mod tests {
             .collect::<Vec<_>>();
         coarse_radii.sort_unstable();
         assert_eq!(coarse_radii, [218, 218, 225, 225, 625]);
+        let mut outer_radii = plan
+            .outer_coarse_predicates
+            .as_ref()
+            .expect("组合查询应有外层粗筛阶段")
+            .iter()
+            .map(|predicate| predicate.radius)
+            .collect::<Vec<_>>();
+        outer_radii.sort_unstable();
+        assert_eq!(outer_radii, [284, 284, 749, 749, 1_149]);
+        assert_eq!(plan.outer_pair_predicates.len(), 8);
+        assert!(plan.outer_pair_predicates.iter().all(|predicate| {
+            predicate.left_coordinate_shift & (GPU_PAIR_ANCHOR_SPAWN | GPU_PAIR_ANCHOR_NETHER_SPAWN)
+                != 0
+        }));
+        assert_eq!(
+            plan.outer_pair_predicates
+                .iter()
+                .filter(|predicate| predicate.left_coordinate_shift & GPU_PAIR_GROUPED != 0)
+                .count(),
+            4
+        );
+        let mut pre_spawn_radii = plan
+            .pre_spawn_predicates
+            .iter()
+            .map(|predicate| predicate.radius)
+            .collect::<Vec<_>>();
+        pre_spawn_radii.sort_unstable();
+        assert_eq!(pre_spawn_radii, [540, 540, 2_797, 2_797, 3_197]);
         assert!(plan.has_pre_spawn_stage());
-        assert_eq!(plan.pair_predicates.len(), 4);
+        assert_eq!(plan.pair_predicates.len(), 8);
         let pair_scores = plan
             .pair_predicates
             .iter()
             .map(|predicate| pair_density_score(&plan.configs, predicate))
             .collect::<Vec<_>>();
-        assert!(pair_scores.windows(2).all(|window| window[0] <= window[1]));
+        assert!(
+            pair_scores[..4]
+                .windows(2)
+                .all(|window| window[0] <= window[1])
+        );
         let mut anchor_radii = plan
             .pair_predicates
             .iter()
             .map(|predicate| predicate.anchor_radius)
             .collect::<Vec<_>>();
         anchor_radii.sort_unstable();
-        assert_eq!(anchor_radii, [340, 2_697, 2_697, 2_697]);
+        assert_eq!(
+            anchor_radii,
+            [340, 2_697, 2_697, 2_697, 2_697, 2_697, 2_697, 2_697,]
+        );
+        assert_eq!(
+            plan.pair_predicates
+                .iter()
+                .filter(|predicate| predicate.left_coordinate_shift & GPU_PAIR_GROUPED != 0)
+                .count(),
+            4
+        );
+        assert_eq!(
+            plan.pair_predicates
+                .iter()
+                .filter(|predicate| {
+                    predicate.left_coordinate_shift & GPU_PAIR_SHIFT_MASK
+                        == GPU_NETHER_COORDINATE_SHIFT
+                })
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1090,12 +1570,122 @@ mod tests {
             });
         }
         let exact = gpu_reference_filter(&exact_candidates, &plan.configs, &plan.predicates);
+        let envelopes = gpu_reference_filter(
+            &origin_candidates,
+            &plan.configs,
+            &plan.pre_spawn_predicates,
+        );
         let paired =
             gpu_reference_pair_filter(&origin_candidates, &plan.configs, &plan.pair_predicates);
         assert!(exact.contains(&1), "样本应覆盖精确共址命中");
         for (seed, exact_match) in exact.into_iter().enumerate() {
             if exact_match == 1 {
+                assert_eq!(envelopes[seed], 1, "seed {seed} 被出生点前原点包络错误淘汰");
                 assert_eq!(paired[seed], 1, "seed {seed} 被出生点前预筛错误淘汰");
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_cross_dimension_filter_never_rejects_exact_colocated_hits() {
+        let specifications = conditions_from_flags(
+            &[],
+            &[],
+            &[
+                "village:1024".to_owned(),
+                "ruined_portal:1024".to_owned(),
+                "ancient_city:1024".to_owned(),
+                "fortress:512".to_owned(),
+                "bastion_remnant:512".to_owned(),
+            ],
+            &[],
+            &[],
+        )
+        .expect("跨维共址条件应可解析");
+        let filter = CompiledFilter::compile(specifications).expect("跨维共址条件应可编译");
+        let plan = GpuPlan::compile(&filter).expect("跨维共址 GPU 计划");
+        assert_eq!(plan.pair_predicates.len(), 8);
+        assert!(
+            plan.pair_predicates[4..]
+                .iter()
+                .all(|predicate| predicate.left_coordinate_shift & GPU_PAIR_GROUPED != 0)
+        );
+
+        let mut native = NativeContext::new().expect("原生上下文");
+        let mut exact_candidates = Vec::new();
+        let mut origin_candidates = Vec::new();
+        for seed in 0_i64..256 {
+            native.set_seed(seed);
+            let spawn = native.spawn_raw().expect("最终出生点");
+            exact_candidates.push(GpuCandidate {
+                seed: seed as u64,
+                spawn_x: spawn.position.x,
+                spawn_z: spawn.position.z,
+            });
+            origin_candidates.push(GpuCandidate {
+                seed: seed as u64,
+                spawn_x: 0,
+                spawn_z: 0,
+            });
+        }
+        let exact = gpu_reference_filter(&exact_candidates, &plan.configs, &plan.predicates);
+        let paired =
+            gpu_reference_pair_filter(&origin_candidates, &plan.configs, &plan.pair_predicates);
+        assert!(exact.contains(&1), "样本应覆盖跨维精确共址命中");
+        for (seed, exact_match) in exact.into_iter().enumerate() {
+            if exact_match == 1 {
+                assert_eq!(paired[seed], 1, "seed {seed} 被跨维共址预筛错误淘汰");
+            }
+        }
+    }
+
+    #[test]
+    fn outer_anchor_pair_filter_never_rejects_exact_colocated_hits() {
+        let specifications = conditions_from_flags(
+            &[],
+            &[],
+            &[
+                "village:1024".to_owned(),
+                "ruined_portal:1024".to_owned(),
+                "fortress:512".to_owned(),
+                "bastion_remnant:512".to_owned(),
+            ],
+            &[],
+            &[],
+        )
+        .expect("外层共锚条件应可解析");
+        let filter = CompiledFilter::compile(specifications).expect("外层共锚条件应可编译");
+        let plan = GpuPlan::compile(&filter).expect("外层共锚 GPU 计划");
+        assert_eq!(plan.outer_pair_predicates.len(), 5);
+
+        let mut native = NativeContext::new().expect("原生上下文");
+        let mut exact_candidates = Vec::new();
+        let mut displaced_candidates = Vec::new();
+        for seed in 0_i64..256 {
+            native.set_seed(seed);
+            let spawn = native.spawn_raw().expect("最终出生点");
+            exact_candidates.push(GpuCandidate {
+                seed: seed as u64,
+                spawn_x: spawn.position.x,
+                spawn_z: spawn.position.z,
+            });
+            // sqrt(400² + 400²) < 649，覆盖外层锚点允许的保守误差。
+            displaced_candidates.push(GpuCandidate {
+                seed: seed as u64,
+                spawn_x: spawn.position.x + 400,
+                spawn_z: spawn.position.z - 400,
+            });
+        }
+        let exact = gpu_reference_filter(&exact_candidates, &plan.configs, &plan.predicates);
+        let paired = gpu_reference_pair_filter(
+            &displaced_candidates,
+            &plan.configs,
+            &plan.outer_pair_predicates,
+        );
+        assert!(exact.contains(&1), "样本应覆盖外层精确共锚命中");
+        for (seed, exact_match) in exact.into_iter().enumerate() {
+            if exact_match == 1 {
+                assert_eq!(paired[seed], 1, "seed {seed} 被外层共锚预筛错误淘汰");
             }
         }
     }
@@ -1324,6 +1914,9 @@ mod tests {
                     minimum: 1,
                 }],
                 coarse_predicates: None,
+                outer_coarse_predicates: None,
+                outer_pair_predicates: Vec::new(),
+                pre_spawn_predicates: Vec::new(),
                 pair_predicates: Vec::new(),
                 needs_spawn: false,
             };
@@ -1366,6 +1959,18 @@ mod tests {
             assert_eq!(actual, expected, "强要塞 GPU 包络与 CPU 参考不一致");
         }
 
+        {
+            let plan = GpuPlan::compile(&filter_from_structure("end_city:500"))
+                .expect("末地折跃门 GPU 计划");
+            let expected = gpu_reference_filter(&candidates, &plan.configs, &plan.predicates);
+            let mut backend = BackendContext::create(0, &plan.configs, &plan.predicates, &[])
+                .expect("创建末地折跃门 GPU 粗筛上下文");
+            let actual = backend
+                .filter(&candidates)
+                .expect("执行末地折跃门 GPU 粗筛");
+            assert_eq!(actual, expected, "末地折跃门 GPU 包络与 CPU 参考不一致");
+        }
+
         let specifications = conditions_from_flags(
             &[],
             &[],
@@ -1382,6 +1987,53 @@ mod tests {
             .expect("创建 GPU 共址预筛上下文");
         let actual = backend.filter(&candidates).expect("执行 GPU 共址预筛内核");
         assert_eq!(actual, expected, "GPU 共址预筛结果与 CPU 参考实现不一致");
+
+        let specifications = conditions_from_flags(
+            &[],
+            &[],
+            &[
+                "village:1024".to_owned(),
+                "ruined_portal:1024".to_owned(),
+                "ancient_city:1024".to_owned(),
+                "fortress:512".to_owned(),
+                "bastion_remnant:512".to_owned(),
+            ],
+            &[],
+            &[],
+        )
+        .expect("跨维共址条件应可解析");
+        let filter = CompiledFilter::compile(specifications).expect("跨维共址条件应可编译");
+        let plan = GpuPlan::compile(&filter).expect("跨维共址 GPU 计划");
+        let expected = gpu_reference_pair_filter(&candidates, &plan.configs, &plan.pair_predicates);
+        assert_eq!(expected.len(), candidates.len());
+        let mut backend = BackendContext::create(0, &plan.configs, &[], &plan.pair_predicates)
+            .expect("创建 GPU 跨维共址预筛上下文");
+        let actual = backend
+            .filter(&candidates)
+            .expect("执行 GPU 跨维共址预筛内核");
+        assert_eq!(actual, expected, "GPU 跨维共址结果与 CPU 参考实现不一致");
+
+        let outer_candidates = candidates
+            .iter()
+            .map(|candidate| GpuCandidate {
+                seed: candidate.seed,
+                spawn_x: (candidate.seed as i64 as i32).wrapping_mul(3),
+                spawn_z: (candidate.seed as i64 as i32).wrapping_mul(-2),
+            })
+            .collect::<Vec<_>>();
+        let expected = gpu_reference_pair_filter(
+            &outer_candidates,
+            &plan.configs,
+            &plan.outer_pair_predicates,
+        );
+        assert!(expected.contains(&0) && expected.contains(&1));
+        let mut backend =
+            BackendContext::create(0, &plan.configs, &[], &plan.outer_pair_predicates)
+                .expect("创建 GPU 外层共锚预筛上下文");
+        let actual = backend
+            .filter(&outer_candidates)
+            .expect("执行 GPU 外层共锚预筛内核");
+        assert_eq!(actual, expected, "GPU 外层共锚结果与 CPU 参考实现不一致");
     }
 
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1413,19 +2065,42 @@ mod tests {
         )
         .expect("创建 GPU 出生点上下文");
         let gpu_started = std::time::Instant::now();
+        let outer = backend
+            .estimate_spawn_outer(&candidates)
+            .expect("执行 GPU 外层出生点估算");
+        let state_indices = (0..outer.len())
+            .map(|index| u32::try_from(index).expect("GPU 出生点状态索引"))
+            .collect::<Vec<_>>();
+        let staged = backend
+            .refine_spawn_estimates(&outer, &state_indices)
+            .expect("执行 GPU 内层出生点细化");
         let actual = backend
             .estimate_spawns(&candidates)
             .expect("执行 GPU 出生点估算");
         let gpu_elapsed = gpu_started.elapsed();
+        assert_eq!(staged, actual, "分级 GPU 出生点估算必须与完整内核一致");
         let mut native = NativeContext::new().expect("CPU 世界生成器");
         let cpu_started = std::time::Instant::now();
-        for (candidate, estimate) in candidates.iter().zip(actual) {
+        let refinement_radius = crate::native::spawn_refinement_radius()
+            .expect("出生点细化半径")
+            .expect("当前版本应支持出生点细化");
+        let outer_bound =
+            spawn_config.inner_radius + spawn_config.output_rounding_radius + refinement_radius;
+        for ((candidate, outer), estimate) in candidates.iter().zip(outer).zip(actual) {
             native.set_seed(candidate.seed as i64);
             let expected = native.estimated_spawn().expect("CPU 出生点估算");
             assert_eq!(
                 (estimate.spawn_x, estimate.spawn_z),
                 (expected.x, expected.z),
                 "seed {} 的 GPU 出生点估算不一致",
+                candidate.seed as i64
+            );
+            let spawn = native.spawn_raw().expect("CPU 最终出生点");
+            let dx = i64::from(spawn.position.x) - i64::from(outer.spawn_x);
+            let dz = i64::from(spawn.position.z) - i64::from(outer.spawn_z);
+            assert!(
+                dx * dx + dz * dz <= i64::from(outer_bound) * i64::from(outer_bound),
+                "seed {} 的最终出生点超出 GPU 外层安全包络",
                 candidate.seed as i64
             );
         }

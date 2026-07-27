@@ -135,6 +135,8 @@ pub enum AnchorName {
     Origin,
     Spawn,
     NetherSpawn,
+    #[serde(alias = "end_gateway_exit")]
+    EndGateway,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -195,6 +197,7 @@ pub enum Anchor {
     Origin,
     Spawn,
     NetherSpawn,
+    EndGateway,
     Coordinates { x: i32, z: i32 },
 }
 
@@ -204,6 +207,7 @@ impl Anchor {
             Self::Origin => "origin",
             Self::Spawn => "spawn",
             Self::NetherSpawn => "nether_spawn",
+            Self::EndGateway => "end_gateway",
             Self::Coordinates { .. } => "coordinates",
         }
     }
@@ -592,6 +596,7 @@ fn compile_anchor(anchor: Option<AnchorSpec>, dimension: Dimension) -> Result<An
         Some(AnchorSpec::Named(AnchorName::Origin)) => Anchor::Origin,
         Some(AnchorSpec::Named(AnchorName::Spawn)) => Anchor::Spawn,
         Some(AnchorSpec::Named(AnchorName::NetherSpawn)) => Anchor::NetherSpawn,
+        Some(AnchorSpec::Named(AnchorName::EndGateway)) => Anchor::EndGateway,
         Some(AnchorSpec::Coordinates(value)) => {
             if value.x.unsigned_abs() > MAX_RADIUS || value.z.unsigned_abs() > MAX_RADIUS {
                 bail!(
@@ -608,7 +613,7 @@ fn compile_anchor(anchor: Option<AnchorSpec>, dimension: Dimension) -> Result<An
         None => match dimension {
             Dimension::Overworld => Anchor::Spawn,
             Dimension::Nether => Anchor::NetherSpawn,
-            Dimension::End => Anchor::Origin,
+            Dimension::End => Anchor::EndGateway,
         },
     };
     Ok(anchor)
@@ -847,6 +852,67 @@ mod tests {
                 max_eyes: 5,
             }
         )));
+    }
+
+    #[test]
+    fn end_conditions_default_to_the_first_gateway_exit() {
+        let specifications = conditions_from_flags(
+            &[],
+            &["end:end_highlands:64".to_owned()],
+            &["end_city:500".to_owned()],
+            &[],
+            &[],
+        )
+        .expect("末地 CLI 条件应可解析");
+        let filter = CompiledFilter::compile(specifications).expect("末地条件应可编译");
+        let CompiledCondition::All(conditions) = filter.root else {
+            panic!("根条件应为 all");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert!(conditions.iter().all(|condition| matches!(
+            condition,
+            CompiledCondition::BiomeNear {
+                anchor: Anchor::EndGateway,
+                ..
+            } | CompiledCondition::StructureNear {
+                anchor: Anchor::EndGateway,
+                ..
+            }
+        )));
+
+        let file: FileConfig = serde_json::from_str(
+            r#"{"conditions":[
+                {"type":"structure_near","any_of":["end_city"],"anchor":"origin","radius":500},
+                {"type":"structure_near","any_of":["end_city"],"anchor":"end_gateway","radius":500},
+                {"type":"structure_near","any_of":["end_city"],"anchor":"end_gateway_exit","radius":500}
+            ]}"#,
+        )
+        .expect("显式末地锚点应可解析");
+        let explicit = CompiledFilter::compile(file.conditions).expect("显式末地锚点应可编译");
+        let CompiledCondition::All(conditions) = explicit.root else {
+            panic!("根条件应为 all");
+        };
+        assert!(matches!(
+            conditions[0],
+            CompiledCondition::StructureNear {
+                anchor: Anchor::Origin,
+                ..
+            }
+        ));
+        assert!(matches!(
+            conditions[1],
+            CompiledCondition::StructureNear {
+                anchor: Anchor::EndGateway,
+                ..
+            }
+        ));
+        assert!(matches!(
+            conditions[2],
+            CompiledCondition::StructureNear {
+                anchor: Anchor::EndGateway,
+                ..
+            }
+        ));
     }
 
     #[test]

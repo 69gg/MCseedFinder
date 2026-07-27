@@ -104,15 +104,15 @@ pub struct FilterArgs {
     #[arg(long, value_name = "BIOME[,BIOME]")]
     pub spawn_biome: Vec<String>,
 
-    /// DIMENSION:BIOME[,BIOME]:RADIUS[:Y|Y_MIN..Y_MAX]；可重复且彼此为“并且”
+    /// DIMENSION:BIOME[,BIOME]:RADIUS[:Y|Y_MIN..Y_MAX]；末地默认锚定首个折跃门外岛出口
     #[arg(long, value_name = "SPEC")]
     pub biome_near: Vec<String>,
 
-    /// STRUCTURE[,STRUCTURE]:RADIUS；维度与锚点自动推断，可重复
+    /// STRUCTURE[,STRUCTURE]:RADIUS；末地默认锚定首个折跃门外岛出口，可重复
     #[arg(long, value_name = "SPEC")]
     pub structure_near: Vec<String>,
 
-    /// STRUCTURE:PIECE[,PIECE]:RADIUS；例如 village:blacksmith:1024，可重复
+    /// STRUCTURE:PIECE[,PIECE]:RADIUS；末地默认锚定首个折跃门外岛出口，可重复
     #[arg(long, alias = "substructure-near", value_name = "SPEC")]
     pub piece_near: Vec<String>,
 

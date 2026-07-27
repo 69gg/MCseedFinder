@@ -2,6 +2,7 @@
 #define MCSEED_GPU_PLACEMENT_H
 
 #include "abi.h"
+#include "../version.h"
 
 #include <limits.h>
 #include <math.h>
@@ -67,6 +68,30 @@ MCSEED_GPU_INLINE double mcseed_gpu_java_next_double(uint64_t *seed)
     value <<= 27;
     value += (uint64_t)(uint32_t)mcseed_gpu_java_next(seed, 27);
     return (double)(int64_t)value / (double)(UINT64_C(1) << 53);
+}
+
+MCSEED_GPU_INLINE McSeedGpuPosition mcseed_gpu_first_end_gateway_nominal(
+    uint64_t world_seed
+)
+{
+    const double pi = 3.14159265358979323846264338327950288;
+    uint64_t random = mcseed_gpu_java_set_seed(world_seed);
+    int32_t gateway = mcseed_gpu_java_next_int(
+        &random,
+        MCSEED_END_GATEWAY_COUNT
+    );
+    double angle = 2.0 * (-pi + (pi / MCSEED_END_GATEWAY_COUNT) * gateway);
+    double source_x = floor(MCSEED_END_GATEWAY_RING_RADIUS * cos(angle));
+    double source_z = floor(MCSEED_END_GATEWAY_RING_RADIUS * sin(angle));
+    double inverse_radius = 1.0 / sqrt(source_x * source_x + source_z * source_z);
+    McSeedGpuPosition position;
+    position.x = (int32_t)floor(
+        source_x * inverse_radius * MCSEED_END_GATEWAY_LINK_DISTANCE
+    );
+    position.z = (int32_t)floor(
+        source_z * inverse_radius * MCSEED_END_GATEWAY_LINK_DISTANCE
+    );
+    return position;
 }
 
 MCSEED_GPU_INLINE McSeedGpuPosition mcseed_gpu_feature_position(
@@ -351,6 +376,14 @@ MCSEED_GPU_INLINE void mcseed_gpu_resolve_anchor(
         *anchor_x = predicate->anchor_x;
         *anchor_z = predicate->anchor_z;
         break;
+    case MCSEED_GPU_ANCHOR_END_GATEWAY: {
+        McSeedGpuPosition gateway = mcseed_gpu_first_end_gateway_nominal(
+            candidate->seed
+        );
+        *anchor_x = gateway.x;
+        *anchor_z = gateway.z;
+        break;
+    }
     default:
         *anchor_x = 0;
         *anchor_z = 0;
@@ -430,6 +463,155 @@ MCSEED_GPU_INLINE int mcseed_gpu_predicate_matches(
     return 0;
 }
 
+#define MCSEED_GPU_PAIR_GROUPED UINT32_C(0x80000000)
+#define MCSEED_GPU_PAIR_ANCHOR_SPAWN UINT32_C(0x40000000)
+#define MCSEED_GPU_PAIR_ANCHOR_NETHER_SPAWN UINT32_C(0x20000000)
+#define MCSEED_GPU_PAIR_SHIFT_MASK UINT32_C(31)
+
+MCSEED_GPU_INLINE McSeedGpuPosition mcseed_gpu_pair_anchor(
+    const McSeedGpuCandidate *candidate,
+    const McSeedGpuPairPredicate *predicate
+)
+{
+    McSeedGpuPosition anchor = {0, 0};
+    if ((predicate->left_coordinate_shift &
+            MCSEED_GPU_PAIR_ANCHOR_NETHER_SPAWN) != 0) {
+        anchor.x = (int32_t)mcseed_gpu_floor_div_i64(candidate->spawn_x, 8);
+        anchor.z = (int32_t)mcseed_gpu_floor_div_i64(candidate->spawn_z, 8);
+    } else if ((predicate->left_coordinate_shift &
+            MCSEED_GPU_PAIR_ANCHOR_SPAWN) != 0) {
+        anchor.x = candidate->spawn_x;
+        anchor.z = candidate->spawn_z;
+    }
+    return anchor;
+}
+
+MCSEED_GPU_INLINE int mcseed_gpu_pair_has_right_for_left(
+    const McSeedGpuCandidate *candidate,
+    const McSeedGpuStructureConfig *configs,
+    const McSeedGpuPairPredicate *predicate,
+    McSeedGpuPosition left_position,
+    McSeedGpuPosition anchor_position
+)
+{
+    const uint32_t shift =
+        predicate->left_coordinate_shift & MCSEED_GPU_PAIR_SHIFT_MASK;
+    uint64_t scale;
+    uint64_t projected_anchor_radius = predicate->anchor_radius;
+    uint64_t projected_left_radius = predicate->left_radius;
+    uint64_t right_envelope_u64;
+    uint64_t pair_radius_u64;
+    uint32_t right_envelope;
+    uint32_t pair_radius;
+    McSeedGpuPosition projected_left_position = left_position;
+    McSeedGpuPosition projected_anchor_position = anchor_position;
+    uint32_t right_config_index;
+
+    if (shift > 30)
+        return 1;
+    scale = UINT64_C(1) << shift;
+    if (shift != 0) {
+        int64_t projected_x;
+        int64_t projected_z;
+        projected_anchor_radius =
+            (projected_anchor_radius + scale - 1) / scale + 2;
+        projected_left_radius =
+            (projected_left_radius + scale - 1) / scale + 2;
+        projected_x = mcseed_gpu_floor_div_i64(
+            left_position.x, (int64_t)scale
+        );
+        projected_z = mcseed_gpu_floor_div_i64(
+            left_position.z, (int64_t)scale
+        );
+        if (projected_x < INT32_MIN || projected_x > INT32_MAX ||
+            projected_z < INT32_MIN || projected_z > INT32_MAX)
+            return 1;
+        projected_left_position.x = (int32_t)projected_x;
+        projected_left_position.z = (int32_t)projected_z;
+        projected_x = mcseed_gpu_floor_div_i64(
+            anchor_position.x, (int64_t)scale
+        );
+        projected_z = mcseed_gpu_floor_div_i64(
+            anchor_position.z, (int64_t)scale
+        );
+        if (projected_x < INT32_MIN || projected_x > INT32_MAX ||
+            projected_z < INT32_MIN || projected_z > INT32_MAX)
+            return 1;
+        projected_anchor_position.x = (int32_t)projected_x;
+        projected_anchor_position.z = (int32_t)projected_z;
+    }
+    right_envelope_u64 = projected_anchor_radius + predicate->right_radius;
+    pair_radius_u64 = projected_left_radius + predicate->right_radius;
+    if (right_envelope_u64 > UINT32_MAX || pair_radius_u64 > UINT32_MAX)
+        return 1;
+    right_envelope = (uint32_t)right_envelope_u64;
+    pair_radius = (uint32_t)pair_radius_u64;
+
+    for (right_config_index = 0;
+         right_config_index < predicate->right_config_count;
+         right_config_index++) {
+        const McSeedGpuStructureConfig *right_config =
+            &configs[predicate->right_config_offset + right_config_index];
+        int64_t right_span;
+        int64_t right_region_x_min;
+        int64_t right_region_x_max;
+        int64_t right_region_z_min;
+        int64_t right_region_z_max;
+        int64_t right_region_z;
+        if (right_config->kind == MCSEED_GPU_PLACEMENT_STRONGHOLD)
+            return 1;
+        right_span = (int64_t)right_config->region_size * 16;
+        right_region_x_min = mcseed_gpu_floor_div_i64(
+            (int64_t)projected_left_position.x - pair_radius, right_span
+        ) - 1;
+        right_region_x_max = mcseed_gpu_floor_div_i64(
+            (int64_t)projected_left_position.x + pair_radius, right_span
+        ) + 1;
+        right_region_z_min = mcseed_gpu_floor_div_i64(
+            (int64_t)projected_left_position.z - pair_radius, right_span
+        ) - 1;
+        right_region_z_max = mcseed_gpu_floor_div_i64(
+            (int64_t)projected_left_position.z + pair_radius, right_span
+        ) + 1;
+
+        for (right_region_z = right_region_z_min;
+             right_region_z <= right_region_z_max;
+             right_region_z++) {
+            int64_t right_region_x;
+            if (right_region_z < INT32_MIN || right_region_z > INT32_MAX)
+                continue;
+            for (right_region_x = right_region_x_min;
+                 right_region_x <= right_region_x_max;
+                 right_region_x++) {
+                McSeedGpuPosition right_position;
+                if (right_region_x < INT32_MIN || right_region_x > INT32_MAX)
+                    continue;
+                if (mcseed_gpu_position_for_region(
+                        right_config,
+                        candidate->seed,
+                        (int32_t)right_region_x,
+                        (int32_t)right_region_z,
+                        &right_position
+                    ) &&
+                    mcseed_gpu_within_radius(
+                        right_position,
+                        projected_anchor_position.x,
+                        projected_anchor_position.z,
+                        right_envelope
+                    ) &&
+                    mcseed_gpu_within_radius(
+                        right_position,
+                        projected_left_position.x,
+                        projected_left_position.z,
+                        pair_radius
+                    ))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
     const McSeedGpuCandidate *candidate,
     const McSeedGpuStructureConfig *configs,
@@ -438,15 +620,11 @@ MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
 {
     uint64_t left_envelope_u64 = (uint64_t)predicate->anchor_radius +
         predicate->left_radius;
-    uint64_t right_envelope_u64 = (uint64_t)predicate->anchor_radius +
-        predicate->right_radius;
-    uint64_t pair_radius_u64 = (uint64_t)predicate->left_radius +
-        predicate->right_radius;
     uint32_t left_envelope;
-    uint32_t right_envelope;
-    uint32_t pair_radius;
     uint32_t left_config_index;
-    McSeedGpuPosition origin = {0, 0};
+    McSeedGpuPosition anchor_position = mcseed_gpu_pair_anchor(
+        candidate, predicate
+    );
 
     /* Concentric rings do not have independent random-spread regions. */
     for (left_config_index = 0;
@@ -456,20 +634,9 @@ MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
             MCSEED_GPU_PLACEMENT_STRONGHOLD)
             return 1;
     }
-    for (left_config_index = 0;
-         left_config_index < predicate->right_config_count;
-         left_config_index++) {
-        if (configs[predicate->right_config_offset + left_config_index].kind ==
-            MCSEED_GPU_PLACEMENT_STRONGHOLD)
-            return 1;
-    }
-
-    if (left_envelope_u64 > UINT32_MAX || right_envelope_u64 > UINT32_MAX ||
-        pair_radius_u64 > UINT32_MAX)
+    if (left_envelope_u64 > UINT32_MAX)
         return 1;
     left_envelope = (uint32_t)left_envelope_u64;
-    right_envelope = (uint32_t)right_envelope_u64;
-    pair_radius = (uint32_t)pair_radius_u64;
 
     for (left_config_index = 0;
          left_config_index < predicate->left_config_count;
@@ -477,25 +644,30 @@ MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
         const McSeedGpuStructureConfig *left_config =
             &configs[predicate->left_config_offset + left_config_index];
         int64_t left_span = (int64_t)left_config->region_size * 16;
-        int64_t left_region_min = mcseed_gpu_floor_div_i64(
-            -(int64_t)left_envelope, left_span
+        int64_t left_region_x_min = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.x - left_envelope, left_span
         ) - 1;
-        int64_t left_region_max = mcseed_gpu_floor_div_i64(
-            (int64_t)left_envelope, left_span
+        int64_t left_region_x_max = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.x + left_envelope, left_span
+        ) + 1;
+        int64_t left_region_z_min = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.z - left_envelope, left_span
+        ) - 1;
+        int64_t left_region_z_max = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.z + left_envelope, left_span
         ) + 1;
         int64_t left_region_z;
 
-        for (left_region_z = left_region_min;
-             left_region_z <= left_region_max;
+        for (left_region_z = left_region_z_min;
+             left_region_z <= left_region_z_max;
              left_region_z++) {
             int64_t left_region_x;
             if (left_region_z < INT32_MIN || left_region_z > INT32_MAX)
                 continue;
-            for (left_region_x = left_region_min;
-                 left_region_x <= left_region_max;
+            for (left_region_x = left_region_x_min;
+                 left_region_x <= left_region_x_max;
                  left_region_x++) {
                 McSeedGpuPosition left_position;
-                uint32_t right_config_index;
                 if (left_region_x < INT32_MIN || left_region_x > INT32_MAX)
                     continue;
                 if (!mcseed_gpu_position_for_region(
@@ -506,67 +678,125 @@ MCSEED_GPU_INLINE int mcseed_gpu_pair_predicate_matches(
                         &left_position
                     ) ||
                     !mcseed_gpu_within_radius(
-                        left_position, origin.x, origin.z, left_envelope
+                        left_position,
+                        anchor_position.x,
+                        anchor_position.z,
+                        left_envelope
+                    ))
+                    continue;
+                if (mcseed_gpu_pair_has_right_for_left(
+                        candidate,
+                        configs,
+                        predicate,
+                        left_position,
+                        anchor_position
+                    ))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+MCSEED_GPU_INLINE int mcseed_gpu_pair_group_matches(
+    const McSeedGpuCandidate *candidate,
+    const McSeedGpuStructureConfig *configs,
+    const McSeedGpuPairPredicate *predicates,
+    size_t predicate_count
+)
+{
+    const McSeedGpuPairPredicate *first = &predicates[0];
+    uint64_t left_envelope_u64 = (uint64_t)first->anchor_radius +
+        first->left_radius;
+    uint32_t left_envelope;
+    uint32_t left_config_index;
+    McSeedGpuPosition anchor_position = mcseed_gpu_pair_anchor(candidate, first);
+
+    if (predicate_count == 0 || left_envelope_u64 > UINT32_MAX)
+        return 1;
+    left_envelope = (uint32_t)left_envelope_u64;
+    for (left_config_index = 0;
+         left_config_index < first->left_config_count;
+         left_config_index++) {
+        if (configs[first->left_config_offset + left_config_index].kind ==
+            MCSEED_GPU_PLACEMENT_STRONGHOLD)
+            return 1;
+    }
+
+    for (left_config_index = 0;
+         left_config_index < first->left_config_count;
+         left_config_index++) {
+        const McSeedGpuStructureConfig *left_config =
+            &configs[first->left_config_offset + left_config_index];
+        int64_t left_span = (int64_t)left_config->region_size * 16;
+        int64_t left_region_x_min = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.x - left_envelope, left_span
+        ) - 1;
+        int64_t left_region_x_max = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.x + left_envelope, left_span
+        ) + 1;
+        int64_t left_region_z_min = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.z - left_envelope, left_span
+        ) - 1;
+        int64_t left_region_z_max = mcseed_gpu_floor_div_i64(
+            (int64_t)anchor_position.z + left_envelope, left_span
+        ) + 1;
+        int64_t left_region_z;
+
+        for (left_region_z = left_region_z_min;
+             left_region_z <= left_region_z_max;
+             left_region_z++) {
+            int64_t left_region_x;
+            if (left_region_z < INT32_MIN || left_region_z > INT32_MAX)
+                continue;
+            for (left_region_x = left_region_x_min;
+                 left_region_x <= left_region_x_max;
+                 left_region_x++) {
+                McSeedGpuPosition left_position;
+                size_t predicate_index;
+                int matched = 1;
+                if (left_region_x < INT32_MIN || left_region_x > INT32_MAX)
+                    continue;
+                if (!mcseed_gpu_position_for_region(
+                        left_config,
+                        candidate->seed,
+                        (int32_t)left_region_x,
+                        (int32_t)left_region_z,
+                        &left_position
+                    ) ||
+                    !mcseed_gpu_within_radius(
+                        left_position,
+                        anchor_position.x,
+                        anchor_position.z,
+                        left_envelope
                     ))
                     continue;
 
-                for (right_config_index = 0;
-                     right_config_index < predicate->right_config_count;
-                     right_config_index++) {
-                    const McSeedGpuStructureConfig *right_config =
-                        &configs[predicate->right_config_offset + right_config_index];
-                    int64_t right_span = (int64_t)right_config->region_size * 16;
-                    int64_t right_region_x_min = mcseed_gpu_floor_div_i64(
-                        (int64_t)left_position.x - pair_radius, right_span
-                    ) - 1;
-                    int64_t right_region_x_max = mcseed_gpu_floor_div_i64(
-                        (int64_t)left_position.x + pair_radius, right_span
-                    ) + 1;
-                    int64_t right_region_z_min = mcseed_gpu_floor_div_i64(
-                        (int64_t)left_position.z - pair_radius, right_span
-                    ) - 1;
-                    int64_t right_region_z_max = mcseed_gpu_floor_div_i64(
-                        (int64_t)left_position.z + pair_radius, right_span
-                    ) + 1;
-                    int64_t right_region_z;
-
-                    for (right_region_z = right_region_z_min;
-                         right_region_z <= right_region_z_max;
-                         right_region_z++) {
-                        int64_t right_region_x;
-                        if (right_region_z < INT32_MIN || right_region_z > INT32_MAX)
-                            continue;
-                        for (right_region_x = right_region_x_min;
-                             right_region_x <= right_region_x_max;
-                             right_region_x++) {
-                            McSeedGpuPosition right_position;
-                            if (right_region_x < INT32_MIN ||
-                                right_region_x > INT32_MAX)
-                                continue;
-                            if (!mcseed_gpu_position_for_region(
-                                    right_config,
-                                    candidate->seed,
-                                    (int32_t)right_region_x,
-                                    (int32_t)right_region_z,
-                                    &right_position
-                                ) ||
-                                !mcseed_gpu_within_radius(
-                                    right_position,
-                                    origin.x,
-                                    origin.z,
-                                    right_envelope
-                                ) ||
-                                !mcseed_gpu_within_radius(
-                                    right_position,
-                                    left_position.x,
-                                    left_position.z,
-                                    pair_radius
-                                ))
-                                continue;
-                            return 1;
-                        }
+                for (predicate_index = 0;
+                     predicate_index < predicate_count;
+                     predicate_index++) {
+                    const McSeedGpuPairPredicate *predicate =
+                        &predicates[predicate_index];
+                    if ((predicate->left_coordinate_shift &
+                            MCSEED_GPU_PAIR_GROUPED) == 0 ||
+                        predicate->left_config_offset != first->left_config_offset ||
+                        predicate->left_config_count != first->left_config_count ||
+                        predicate->left_radius != first->left_radius ||
+                        predicate->anchor_radius != first->anchor_radius)
+                        return 1;
+                    if (!mcseed_gpu_pair_has_right_for_left(
+                            candidate,
+                            configs,
+                            predicate,
+                            left_position,
+                            anchor_position
+                        )) {
+                        matched = 0;
+                        break;
                     }
                 }
+                if (matched)
+                    return 1;
             }
         }
     }
@@ -580,12 +810,27 @@ MCSEED_GPU_INLINE int mcseed_gpu_candidate_matches_pairs(
     size_t predicate_count
 )
 {
-    size_t index;
-    for (index = 0; index < predicate_count; index++) {
+    size_t index = 0;
+    while (index < predicate_count) {
+        if ((predicates[index].left_coordinate_shift &
+                MCSEED_GPU_PAIR_GROUPED) != 0) {
+            size_t end = index + 1;
+            while (end < predicate_count &&
+                   (predicates[end].left_coordinate_shift &
+                        MCSEED_GPU_PAIR_GROUPED) != 0)
+                end++;
+            if (!mcseed_gpu_pair_group_matches(
+                    candidate, configs, &predicates[index], end - index
+                ))
+                return 0;
+            index = end;
+            continue;
+        }
         if (!mcseed_gpu_pair_predicate_matches(
                 candidate, configs, &predicates[index]
             ))
             return 0;
+        index++;
     }
     return 1;
 }
@@ -606,5 +851,9 @@ MCSEED_GPU_INLINE int mcseed_gpu_candidate_matches(
 }
 
 #undef MCSEED_GPU_INLINE
+#undef MCSEED_GPU_PAIR_GROUPED
+#undef MCSEED_GPU_PAIR_ANCHOR_SPAWN
+#undef MCSEED_GPU_PAIR_ANCHOR_NETHER_SPAWN
+#undef MCSEED_GPU_PAIR_SHIFT_MASK
 
 #endif

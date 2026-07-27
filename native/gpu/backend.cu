@@ -65,12 +65,17 @@ typedef struct McSeedGpuContext {
     McSeedGpuSpawnOffset *inner_spawn_offsets;
     McSeedGpuCandidate *candidates;
     uint8_t *matches;
+    uint32_t *spawn_state_indices;
+    McSeedGpuPerlinNoise *spawn_states;
     size_t config_count;
     size_t predicate_count;
     size_t pair_predicate_count;
     uint32_t outer_spawn_offset_count;
     uint32_t inner_spawn_offset_count;
+    uint32_t spawn_perlin_count;
     size_t candidate_capacity;
+    size_t spawn_state_capacity;
+    size_t spawn_state_generation_count;
 } McSeedGpuContext;
 
 static void mcseed_gpu_write_error(
@@ -190,6 +195,10 @@ static void mcseed_gpu_context_cleanup(McSeedGpuContext *context)
         (void)mcseed_gpu_free(context->candidates);
     if (context->matches)
         (void)mcseed_gpu_free(context->matches);
+    if (context->spawn_state_indices)
+        (void)mcseed_gpu_free(context->spawn_state_indices);
+    if (context->spawn_states)
+        (void)mcseed_gpu_free(context->spawn_states);
     if (context->configs)
         (void)mcseed_gpu_free(context->configs);
     if (context->predicates)
@@ -338,6 +347,7 @@ static int mcseed_gpu_prepare_spawn_estimator(
         return 0;
     context->outer_spawn_offset_count = outer_count;
     context->inner_spawn_offset_count = inner_count;
+    context->spawn_perlin_count = spawn_config->perlin_count;
     return 1;
 }
 
@@ -487,6 +497,7 @@ static int mcseed_gpu_reserve_candidates(
     size_t capacity;
     McSeedGpuCandidate *new_candidates = NULL;
     uint8_t *new_matches = NULL;
+    uint32_t *new_state_indices = NULL;
     if (candidate_count <= context->candidate_capacity)
         return 1;
     capacity = context->candidate_capacity ? context->candidate_capacity : 4096;
@@ -514,14 +525,58 @@ static int mcseed_gpu_reserve_candidates(
         (void)mcseed_gpu_free(new_candidates);
         return 0;
     }
+    if (!mcseed_gpu_check(
+            mcseed_gpu_malloc(
+                (void **)&new_state_indices,
+                capacity * sizeof(*new_state_indices)
+            ),
+            error,
+            error_capacity,
+            "分配 GPU 出生点状态索引缓冲区"
+        )) {
+        (void)mcseed_gpu_free(new_candidates);
+        (void)mcseed_gpu_free(new_matches);
+        return 0;
+    }
     if (context->candidates)
         (void)mcseed_gpu_free(context->candidates);
     if (context->matches)
         (void)mcseed_gpu_free(context->matches);
+    if (context->spawn_state_indices)
+        (void)mcseed_gpu_free(context->spawn_state_indices);
     context->candidates = new_candidates;
     context->matches = new_matches;
+    context->spawn_state_indices = new_state_indices;
     context->candidate_capacity = capacity;
     return 1;
+}
+
+static void mcseed_gpu_try_reserve_spawn_states(
+    McSeedGpuContext *context,
+    size_t candidate_count
+)
+{
+    McSeedGpuPerlinNoise *states = NULL;
+    size_t state_count;
+    size_t bytes;
+    size_t capacity = context->candidate_capacity;
+    if (!context->spawn_perlin_count || capacity < candidate_count ||
+        candidate_count <= context->spawn_state_capacity)
+        return;
+    if (capacity > SIZE_MAX / context->spawn_perlin_count)
+        return;
+    state_count = capacity * context->spawn_perlin_count;
+    if (state_count > SIZE_MAX / sizeof(*states))
+        return;
+    bytes = state_count * sizeof(*states);
+    if (mcseed_gpu_malloc((void **)&states, bytes) != MCSEED_GPU_SUCCESS) {
+        (void)mcseed_gpu_get_last_error();
+        return;
+    }
+    if (context->spawn_states)
+        (void)mcseed_gpu_free(context->spawn_states);
+    context->spawn_states = states;
+    context->spawn_state_capacity = capacity;
 }
 
 extern "C" int32_t mcseed_gpu_filter(
@@ -616,17 +671,24 @@ extern "C" int32_t mcseed_gpu_filter(
     return 0;
 }
 
-extern "C" int32_t mcseed_gpu_estimate_spawns(
+static int32_t mcseed_gpu_run_spawn_stage(
     McSeedGpuContext *context,
     const McSeedGpuCandidate *candidates,
+    const uint32_t *state_indices,
     size_t candidate_count,
     McSeedGpuCandidate *estimates,
+    uint32_t stage,
     char *error,
     size_t error_capacity
 )
 {
-    const uint32_t threads = MCSEED_GPU_SPAWN_BLOCK_THREADS;
+    const uint32_t threads = stage == MCSEED_GPU_SPAWN_STAGE_OUTER
+        ? MCSEED_GPU_SPAWN_OUTER_THREADS
+        : MCSEED_GPU_SPAWN_BLOCK_THREADS;
     uint32_t blocks;
+    const uint32_t *device_state_indices = NULL;
+    McSeedGpuPerlinNoise *spawn_states = NULL;
+    size_t spawn_state_count = 0;
     if (!context || (!candidates && candidate_count) || (!estimates && candidate_count))
         return -1;
     if (!context->spawn_config) {
@@ -659,32 +721,95 @@ extern "C" int32_t mcseed_gpu_estimate_spawns(
         ))
         return -4;
 
+    if (state_indices) {
+        if (!mcseed_gpu_check(
+                mcseed_gpu_memcpy_async(
+                    context->spawn_state_indices,
+                    state_indices,
+                    candidate_count * sizeof(*state_indices),
+                    MCSEED_GPU_COPY_HOST_TO_DEVICE,
+                    context->stream
+                ),
+                error,
+                error_capacity,
+                "上传 GPU 出生点状态索引"
+            ))
+            return -4;
+        device_state_indices = context->spawn_state_indices;
+        spawn_states = context->spawn_states;
+        spawn_state_count = context->spawn_state_generation_count;
+    } else if (stage == MCSEED_GPU_SPAWN_STAGE_OUTER) {
+        mcseed_gpu_try_reserve_spawn_states(context, candidate_count);
+        if (context->spawn_state_capacity >= candidate_count) {
+            spawn_states = context->spawn_states;
+            spawn_state_count = candidate_count;
+        }
+        context->spawn_state_generation_count = 0;
+    }
+
     blocks = (uint32_t)candidate_count;
 #if defined(MCSEED_GPU_HIP)
-    hipLaunchKernelGGL(
-        mcseed_gpu_estimate_spawn_kernel,
-        dim3(blocks),
-        dim3(threads),
-        0,
-        context->stream,
-        context->candidates,
-        candidate_count,
-        context->spawn_config,
-        context->outer_spawn_offsets,
-        context->outer_spawn_offset_count,
-        context->inner_spawn_offsets,
-        context->inner_spawn_offset_count
-    );
+    if (stage == MCSEED_GPU_SPAWN_STAGE_OUTER) {
+        hipLaunchKernelGGL(
+            mcseed_gpu_estimate_spawn_outer_kernel,
+            dim3(blocks),
+            dim3(threads),
+            0,
+            context->stream,
+            context->candidates,
+            candidate_count,
+            context->spawn_config,
+            context->outer_spawn_offsets,
+            context->outer_spawn_offset_count,
+            spawn_states,
+            spawn_state_count
+        );
+    } else {
+        hipLaunchKernelGGL(
+            mcseed_gpu_estimate_spawn_kernel,
+            dim3(blocks),
+            dim3(threads),
+            0,
+            context->stream,
+            context->candidates,
+            candidate_count,
+            context->spawn_config,
+            context->outer_spawn_offsets,
+            context->outer_spawn_offset_count,
+            context->inner_spawn_offsets,
+            context->inner_spawn_offset_count,
+            stage,
+            device_state_indices,
+            spawn_states,
+            spawn_state_count
+        );
+    }
 #else
-    mcseed_gpu_estimate_spawn_kernel<<<blocks, threads, 0, context->stream>>>(
-        context->candidates,
-        candidate_count,
-        context->spawn_config,
-        context->outer_spawn_offsets,
-        context->outer_spawn_offset_count,
-        context->inner_spawn_offsets,
-        context->inner_spawn_offset_count
-    );
+    if (stage == MCSEED_GPU_SPAWN_STAGE_OUTER) {
+        mcseed_gpu_estimate_spawn_outer_kernel<<<blocks, threads, 0, context->stream>>>(
+            context->candidates,
+            candidate_count,
+            context->spawn_config,
+            context->outer_spawn_offsets,
+            context->outer_spawn_offset_count,
+            spawn_states,
+            spawn_state_count
+        );
+    } else {
+        mcseed_gpu_estimate_spawn_kernel<<<blocks, threads, 0, context->stream>>>(
+            context->candidates,
+            candidate_count,
+            context->spawn_config,
+            context->outer_spawn_offsets,
+            context->outer_spawn_offset_count,
+            context->inner_spawn_offsets,
+            context->inner_spawn_offset_count,
+            stage,
+            device_state_indices,
+            spawn_states,
+            spawn_state_count
+        );
+    }
 #endif
     if (!mcseed_gpu_check(
             mcseed_gpu_get_last_error(), error, error_capacity, "启动 GPU 出生点估算内核"
@@ -708,5 +833,73 @@ extern "C" int32_t mcseed_gpu_estimate_spawns(
             "同步 GPU 出生点估算"
         ))
         return -5;
+    if (stage == MCSEED_GPU_SPAWN_STAGE_OUTER && spawn_states)
+        context->spawn_state_generation_count = candidate_count;
     return 0;
+}
+
+extern "C" int32_t mcseed_gpu_estimate_spawns(
+    McSeedGpuContext *context,
+    const McSeedGpuCandidate *candidates,
+    size_t candidate_count,
+    McSeedGpuCandidate *estimates,
+    char *error,
+    size_t error_capacity
+)
+{
+    return mcseed_gpu_run_spawn_stage(
+        context,
+        candidates,
+        NULL,
+        candidate_count,
+        estimates,
+        MCSEED_GPU_SPAWN_STAGE_FULL,
+        error,
+        error_capacity
+    );
+}
+
+extern "C" int32_t mcseed_gpu_estimate_spawn_outer(
+    McSeedGpuContext *context,
+    const McSeedGpuCandidate *candidates,
+    size_t candidate_count,
+    McSeedGpuCandidate *estimates,
+    char *error,
+    size_t error_capacity
+)
+{
+    return mcseed_gpu_run_spawn_stage(
+        context,
+        candidates,
+        NULL,
+        candidate_count,
+        estimates,
+        MCSEED_GPU_SPAWN_STAGE_OUTER,
+        error,
+        error_capacity
+    );
+}
+
+extern "C" int32_t mcseed_gpu_refine_cached_spawn_estimates(
+    McSeedGpuContext *context,
+    const McSeedGpuCandidate *candidates,
+    const uint32_t *state_indices,
+    size_t candidate_count,
+    McSeedGpuCandidate *estimates,
+    char *error,
+    size_t error_capacity
+)
+{
+    if (!state_indices && candidate_count)
+        return -1;
+    return mcseed_gpu_run_spawn_stage(
+        context,
+        candidates,
+        state_indices,
+        candidate_count,
+        estimates,
+        MCSEED_GPU_SPAWN_STAGE_INNER,
+        error,
+        error_capacity
+    );
 }

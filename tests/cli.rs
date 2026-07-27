@@ -84,6 +84,34 @@ fn checks_known_village_blacksmith_and_reports_its_parent() {
 }
 
 #[test]
+fn checks_end_city_from_the_first_gateway_outer_island_exit() {
+    let output = run(&[
+        "check",
+        "2",
+        "--structure-near",
+        "end_city:500",
+        "--format",
+        "jsonl",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = &json_lines(&output)[0];
+    let condition = &report["filter"]["children"][0];
+    assert_eq!(condition["condition"], "structure_near");
+    assert!(
+        condition["description"]
+            .as_str()
+            .expect("条件说明")
+            .contains("end_gateway (-865, 637)")
+    );
+    assert_eq!(condition["hits"][0]["position"]["x"], -1232);
+    assert_eq!(condition["hits"][0]["position"]["z"], 416);
+}
+
+#[test]
 fn reports_and_filters_the_eye_located_stronghold_portal() {
     let output = run(&["check", "0", "--stronghold-eyes", "2", "--format", "jsonl"]);
     assert!(
@@ -318,7 +346,7 @@ fn random_search_honors_requested_count_without_duplicates() {
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 #[test]
-fn gpu_spawn_pipeline_matches_cpu_across_batch_and_thread_counts_when_available() {
+fn gpu_pipeline_matches_cpu_across_batch_thread_and_gateway_anchors_when_available() {
     let probe = run(&[
         "find",
         "--start",
@@ -443,6 +471,41 @@ fn gpu_spawn_pipeline_matches_cpu_across_batch_and_thread_counts_when_available(
         String::from_utf8_lossy(&random_gpu.stderr)
     );
     assert_eq!(json_lines(&random_gpu), json_lines(&random_cpu));
+
+    let gateway_common = [
+        "find",
+        "--start",
+        "0",
+        "--end",
+        "128",
+        "--count",
+        "8",
+        "--threads",
+        "4",
+        "--batch-size",
+        "16",
+        "--structure-near",
+        "end_city:500",
+        "--format",
+        "jsonl",
+    ];
+    let mut gateway_cpu_arguments = gateway_common.to_vec();
+    gateway_cpu_arguments.extend(["--accelerator", "cpu"]);
+    let mut gateway_gpu_arguments = gateway_common.to_vec();
+    gateway_gpu_arguments.extend(["--accelerator", COMPILED_GPU_BACKEND]);
+    let gateway_cpu = run(&gateway_cpu_arguments);
+    let gateway_gpu = run(&gateway_gpu_arguments);
+    assert!(
+        gateway_cpu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gateway_cpu.stderr)
+    );
+    assert!(
+        gateway_gpu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gateway_gpu.stderr)
+    );
+    assert_eq!(json_lines(&gateway_gpu), json_lines(&gateway_cpu));
 }
 
 #[test]
@@ -632,8 +695,12 @@ fn compiled_gpu_search_matches_cpu_on_a_small_fixed_range_when_available() {
     assert_eq!(json_lines(&gpu_single_thread), json_lines(&gpu));
     let gpu_stderr = String::from_utf8_lossy(&gpu.stderr);
     assert!(gpu_stderr.contains(&format!("搜索后端：{backend}:")));
+    assert!(gpu_stderr.contains("GPU 出生点前结构预筛："));
+    assert!(gpu_stderr.contains("GPU 外层出生点粗筛："));
     assert!(gpu_stderr.contains("GPU 出生点粗筛："));
     assert!(gpu_stderr.contains("GPU 预筛选："));
+    assert!(gpu_stderr.contains("外层出生点估算"));
+    assert!(gpu_stderr.contains("内层出生点细化"));
 }
 
 #[test]

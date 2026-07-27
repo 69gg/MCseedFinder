@@ -9,7 +9,7 @@
 - Local path: `vendor/cubiomes/`
 - License: MIT; the original license text is preserved at `vendor/cubiomes/LICENSE`
 
-The vendored revision contains the Minecraft 26.2 biome parameter tree and the `sulfur_caves` biome. MCSeed Finder adds a small C ABI bridge and the missing Nether fossil structure-family placement/biome check in `native/bridge.c`. A local sanitizer-cleanliness patch replaces signed left shifts of negative stronghold chunk coordinates with equivalent 64-bit multiplication; it does not change the generation algorithm.
+The vendored revision contains the Minecraft 26.2 biome parameter tree and the `sulfur_caves` biome. MCSeed Finder adds a small C ABI bridge and the missing Nether fossil structure-family placement/biome check in `native/bridge.c`. Local patches replace signed left shifts of negative stronghold chunk coordinates with equivalent 64-bit multiplication, and synchronize the End gateway helper with 26.2's full 16-step ray loops and empty-route island fallback.
 
 The upstream snapshot also carries an MIT-licensed loot helper by ScriptLine under `vendor/cubiomes/loot/`; its license is preserved as `LICENSE_loot_library.h.txt`. That directory embeds MIT-licensed cJSON by Dave Gamble and contributors, with the full notice preserved at the top of `loot/cjson/cJSON.c` and `cJSON.h`. MCSeed Finder does not compile or call the loot helper, but keeps the complete upstream source snapshot and notices intact.
 

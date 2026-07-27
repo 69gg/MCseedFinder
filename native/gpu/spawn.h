@@ -14,6 +14,7 @@
 
 enum {
     MCSEED_GPU_SPAWN_BLOCK_THREADS = 256,
+    MCSEED_GPU_SPAWN_OUTER_THREADS = 64,
 };
 
 typedef struct McSeedGpuSpawnOffset {
@@ -547,6 +548,12 @@ MCSEED_GPU_DEVICE_INLINE void mcseed_gpu_search_spawn_offsets(
     }
 }
 
+enum {
+    MCSEED_GPU_SPAWN_STAGE_FULL = 0,
+    MCSEED_GPU_SPAWN_STAGE_OUTER = 1,
+    MCSEED_GPU_SPAWN_STAGE_INNER = 2,
+};
+
 __global__ static __launch_bounds__(MCSEED_GPU_SPAWN_BLOCK_THREADS)
 void mcseed_gpu_estimate_spawn_kernel(
     McSeedGpuCandidate *candidates,
@@ -555,7 +562,11 @@ void mcseed_gpu_estimate_spawn_kernel(
     const McSeedGpuSpawnOffset *outer_offsets,
     uint32_t outer_count,
     const McSeedGpuSpawnOffset *inner_offsets,
-    uint32_t inner_count
+    uint32_t inner_count,
+    uint32_t stage,
+    const uint32_t *state_indices,
+    McSeedGpuPerlinNoise *spawn_states,
+    size_t spawn_state_count
 )
 {
     __shared__ McSeedGpuPerlinNoise perlins[MCSEED_GPU_SPAWN_MAX_PERLINS];
@@ -564,6 +575,7 @@ void mcseed_gpu_estimate_spawn_kernel(
     __shared__ uint64_t best_fitness;
     __shared__ int32_t origin_x;
     __shared__ int32_t origin_z;
+    __shared__ uint32_t cached_state;
     const size_t candidate_index = blockIdx.x;
     const uint32_t thread = threadIdx.x;
     McSeedGpuCandidate *candidate;
@@ -571,9 +583,141 @@ void mcseed_gpu_estimate_spawn_kernel(
     if (candidate_index >= candidate_count)
         return;
     candidate = &candidates[candidate_index];
-    if (thread < config->perlin_count) {
+    if (thread == 0) {
+        cached_state = stage == MCSEED_GPU_SPAWN_STAGE_INNER &&
+            state_indices && spawn_states &&
+            state_indices[candidate_index] < spawn_state_count;
+    }
+    __syncthreads();
+    if (cached_state) {
+        const uint32_t state_index = state_indices[candidate_index];
+        const uint64_t *source = (const uint64_t *)(
+            spawn_states + (size_t)state_index * config->perlin_count
+        );
+        uint64_t *destination = (uint64_t *)perlins;
+        const size_t words =
+            (size_t)config->perlin_count * sizeof(*perlins) / sizeof(*source);
+        size_t index;
+        for (index = thread; index < words; index += blockDim.x)
+            destination[index] = source[index];
+    } else {
+        uint32_t index;
+        for (index = thread; index < config->perlin_count; index += blockDim.x) {
+            mcseed_gpu_initialize_perlin(
+                &perlins[index], &config->perlins[index], candidate->seed
+            );
+        }
+    }
+    __syncthreads();
+
+    if (thread == 0) {
+        if (stage == MCSEED_GPU_SPAWN_STAGE_INNER) {
+            origin_x = candidate->spawn_x;
+            origin_z = candidate->spawn_z;
+        } else {
+            origin_x = 0;
+            origin_z = 0;
+        }
+        best_fitness = mcseed_gpu_spawn_fitness(
+            config, perlins, origin_x, origin_z, UINT64_MAX
+        );
+    }
+    __syncthreads();
+
+    if (stage != MCSEED_GPU_SPAWN_STAGE_INNER) {
+        mcseed_gpu_search_spawn_offsets(
+            config,
+            perlins,
+            outer_offsets,
+            outer_count,
+            origin_x,
+            origin_z,
+            best_fitness,
+            fitness_by_thread,
+            rank_by_thread
+        );
+        if (thread == 0) {
+            const uint32_t rank = rank_by_thread[0];
+            best_fitness = fitness_by_thread[0];
+            if (rank != 0) {
+                origin_x = outer_offsets[rank - 1].x;
+                origin_z = outer_offsets[rank - 1].z;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (stage == MCSEED_GPU_SPAWN_STAGE_OUTER && spawn_states &&
+        candidate_index < spawn_state_count) {
+        const uint64_t *source = (const uint64_t *)perlins;
+        uint64_t *destination = (uint64_t *)(
+            spawn_states + candidate_index * config->perlin_count
+        );
+        const size_t words =
+            (size_t)config->perlin_count * sizeof(*perlins) / sizeof(*source);
+        size_t index;
+        for (index = thread; index < words; index += blockDim.x)
+            destination[index] = source[index];
+        __syncthreads();
+    }
+
+    if (stage != MCSEED_GPU_SPAWN_STAGE_OUTER) {
+        mcseed_gpu_search_spawn_offsets(
+            config,
+            perlins,
+            inner_offsets,
+            inner_count,
+            origin_x,
+            origin_z,
+            best_fitness,
+            fitness_by_thread,
+            rank_by_thread
+        );
+        if (thread == 0) {
+            const uint32_t rank = rank_by_thread[0];
+            if (rank != 0) {
+                origin_x += inner_offsets[rank - 1].x;
+                origin_z += inner_offsets[rank - 1].z;
+            }
+            candidate->spawn_x = (origin_x & ~15) + 8;
+            candidate->spawn_z = (origin_z & ~15) + 8;
+        }
+    } else if (thread == 0) {
+        /* Preserve the exact outer winner so the inner stage can resume without
+         * repeating the outer scan. It is also a valid conservative anchor. */
+        candidate->spawn_x = origin_x;
+        candidate->spawn_z = origin_z;
+    }
+}
+
+__global__ static __launch_bounds__(MCSEED_GPU_SPAWN_OUTER_THREADS)
+void mcseed_gpu_estimate_spawn_outer_kernel(
+    McSeedGpuCandidate *candidates,
+    size_t candidate_count,
+    const McSeedGpuSpawnConfig *config,
+    const McSeedGpuSpawnOffset *outer_offsets,
+    uint32_t outer_count,
+    McSeedGpuPerlinNoise *spawn_states,
+    size_t spawn_state_count
+)
+{
+    __shared__ McSeedGpuPerlinNoise perlins[MCSEED_GPU_SPAWN_MAX_PERLINS];
+    __shared__ uint64_t fitness_by_thread[MCSEED_GPU_SPAWN_OUTER_THREADS];
+    __shared__ uint32_t rank_by_thread[MCSEED_GPU_SPAWN_OUTER_THREADS];
+    __shared__ uint64_t best_fitness;
+    __shared__ int32_t origin_x;
+    __shared__ int32_t origin_z;
+    const size_t candidate_index = blockIdx.x;
+    const uint32_t thread = threadIdx.x;
+    McSeedGpuCandidate *candidate;
+    uint32_t index;
+
+    if (candidate_index >= candidate_count)
+        return;
+    candidate = &candidates[candidate_index];
+    for (index = thread; index < config->perlin_count; index += blockDim.x) {
         mcseed_gpu_initialize_perlin(
-            &perlins[thread], &config->perlins[thread], candidate->seed
+            &perlins[index], &config->perlins[index], candidate->seed
         );
     }
     __syncthreads();
@@ -586,7 +730,6 @@ void mcseed_gpu_estimate_spawn_kernel(
         );
     }
     __syncthreads();
-
     mcseed_gpu_search_spawn_offsets(
         config,
         perlins,
@@ -600,7 +743,6 @@ void mcseed_gpu_estimate_spawn_kernel(
     );
     if (thread == 0) {
         const uint32_t rank = rank_by_thread[0];
-        best_fitness = fitness_by_thread[0];
         if (rank != 0) {
             origin_x = outer_offsets[rank - 1].x;
             origin_z = outer_offsets[rank - 1].z;
@@ -608,25 +750,20 @@ void mcseed_gpu_estimate_spawn_kernel(
     }
     __syncthreads();
 
-    mcseed_gpu_search_spawn_offsets(
-        config,
-        perlins,
-        inner_offsets,
-        inner_count,
-        origin_x,
-        origin_z,
-        best_fitness,
-        fitness_by_thread,
-        rank_by_thread
-    );
+    if (spawn_states && candidate_index < spawn_state_count) {
+        const uint64_t *source = (const uint64_t *)perlins;
+        uint64_t *destination = (uint64_t *)(
+            spawn_states + candidate_index * config->perlin_count
+        );
+        const size_t words =
+            (size_t)config->perlin_count * sizeof(*perlins) / sizeof(*source);
+        size_t word;
+        for (word = thread; word < words; word += blockDim.x)
+            destination[word] = source[word];
+    }
     if (thread == 0) {
-        const uint32_t rank = rank_by_thread[0];
-        if (rank != 0) {
-            origin_x += inner_offsets[rank - 1].x;
-            origin_z += inner_offsets[rank - 1].z;
-        }
-        candidate->spawn_x = (origin_x & ~15) + 8;
-        candidate->spawn_z = (origin_z & ~15) + 8;
+        candidate->spawn_x = origin_x;
+        candidate->spawn_z = origin_z;
     }
 }
 

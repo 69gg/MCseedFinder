@@ -276,8 +276,10 @@ struct McSeedContext {
     uint8_t ready_mask;
     uint8_t spawn_ready;
     uint8_t estimated_spawn_ready;
+    uint8_t end_gateway_ready;
     Pos spawn;
     Pos estimated_spawn;
+    Pos end_gateway;
     uint64_t estimated_spawn_rng;
     int32_t spawn_y;
     int32_t spawn_biome;
@@ -456,6 +458,7 @@ void mcseed_context_set_seed(McSeedContext *context, uint64_t seed)
     context->ready_mask = 0;
     context->spawn_ready = 0;
     context->estimated_spawn_ready = 0;
+    context->end_gateway_ready = 0;
     context->terrain_ready = 0;
 }
 
@@ -622,6 +625,55 @@ int32_t mcseed_spawn_origin_radius(uint32_t *radius)
         return -2;
     *radius = (uint32_t)estimate_radius + refinement_radius;
     return 1;
+}
+
+int32_t mcseed_first_end_gateway_exit(
+    McSeedContext *context,
+    McSeedHit *exit
+)
+{
+    Generator *generator;
+    if (!context || !exit)
+        return -1;
+    generator = generator_for_dimension(context, DIM_END);
+    if (!generator)
+        return -2;
+
+    if (!context->end_gateway_ready) {
+        Pos gateways[MCSEED_END_GATEWAY_COUNT];
+        SurfaceNoise surface_noise;
+        getFixedEndGateways(
+            MCSEED_CUBIOMES_VERSION,
+            context->seed,
+            gateways
+        );
+        initSurfaceNoise(&surface_noise, DIM_END, context->seed);
+        context->end_gateway = getLinkedGatewayPos(
+            &generator->en,
+            &surface_noise,
+            context->seed,
+            gateways[0]
+        );
+        context->end_gateway_ready = 1;
+    }
+
+    exit->x = context->end_gateway.x;
+    exit->y = INT32_MIN;
+    exit->z = context->end_gateway.z;
+    exit->id = 0;
+    return 0;
+}
+
+int32_t mcseed_end_gateway_gpu_margin(uint32_t *radius)
+{
+    if (!radius)
+        return -1;
+#if MCSEED_GPU_END_GATEWAY_ALGORITHM == 1
+    *radius = MCSEED_END_GATEWAY_GPU_MARGIN;
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 int32_t mcseed_biome_count(void)

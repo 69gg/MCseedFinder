@@ -64,6 +64,8 @@ unsafe extern "C" {
     fn mcseed_estimated_spawn_reference(context: *mut RawContext, spawn: *mut RawHit) -> c_int;
     fn mcseed_spawn_refinement_radius(radius: *mut c_uint) -> c_int;
     fn mcseed_spawn_origin_radius(radius: *mut c_uint) -> c_int;
+    fn mcseed_first_end_gateway_exit(context: *mut RawContext, exit: *mut RawHit) -> c_int;
+    fn mcseed_end_gateway_gpu_margin(radius: *mut c_uint) -> c_int;
     fn mcseed_gpu_spawn_config(config: *mut GpuSpawnConfig) -> c_int;
 
     fn mcseed_biome_count() -> c_int;
@@ -197,7 +199,7 @@ pub(crate) struct GpuPairPredicate {
     pub left_radius: u32,
     pub right_radius: u32,
     pub anchor_radius: u32,
-    pub reserved: u32,
+    pub left_coordinate_shift: u32,
 }
 
 #[repr(C)]
@@ -246,7 +248,7 @@ pub(crate) struct GpuSpawnConfig {
     pub outer_step: u32,
     pub inner_radius: u32,
     pub inner_step: u32,
-    pub reserved: u32,
+    pub output_rounding_radius: u32,
     pub fitness_scale: u64,
     pub noises: [GpuSpawnNoise; GPU_SPAWN_NOISE_COUNT],
     pub perlins: [GpuSpawnPerlin; GPU_SPAWN_MAX_PERLINS],
@@ -263,7 +265,7 @@ impl Default for GpuSpawnConfig {
             outer_step: 0,
             inner_radius: 0,
             inner_step: 0,
-            reserved: 0,
+            output_rounding_radius: 0,
             fitness_scale: 0,
             noises: [GpuSpawnNoise::default(); GPU_SPAWN_NOISE_COUNT],
             perlins: [GpuSpawnPerlin::default(); GPU_SPAWN_MAX_PERLINS],
@@ -430,6 +432,17 @@ impl NativeContext {
 
     pub fn spawn(&mut self) -> Result<SpawnInfo> {
         self.spawn_raw()?.into_info()
+    }
+
+    pub(crate) fn first_end_gateway_exit(&mut self) -> Result<Position> {
+        let mut raw_hit = RawHit::default();
+        let status = unsafe { mcseed_first_end_gateway_exit(self.raw.as_ptr(), &mut raw_hit) };
+        ensure_status(status, "计算首个末地折跃门的外岛出口")?;
+        Ok(Position {
+            x: raw_hit.x,
+            y: None,
+            z: raw_hit.z,
+        })
     }
 
     pub(crate) fn estimated_spawn(&mut self) -> Result<Position> {
@@ -777,6 +790,15 @@ pub(crate) fn spawn_origin_radius() -> Result<Option<u32>> {
     }
 }
 
+pub(crate) fn end_gateway_gpu_margin() -> Result<Option<u32>> {
+    let mut radius = 0;
+    match unsafe { mcseed_end_gateway_gpu_margin(&mut radius) } {
+        1 => Ok(Some(radius)),
+        0 => Ok(None),
+        status => bail!("读取末地折跃门 GPU 包络半径失败（错误码 {status}）"),
+    }
+}
+
 pub(crate) fn gpu_spawn_config() -> Result<Option<GpuSpawnConfig>> {
     let mut config = GpuSpawnConfig::default();
     match unsafe { mcseed_gpu_spawn_config(&mut config) } {
@@ -789,6 +811,7 @@ pub(crate) fn gpu_spawn_config() -> Result<Option<GpuSpawnConfig>> {
                 || config.inner_step == 0
                 || config.outer_radius < config.outer_step
                 || config.inner_radius < config.inner_step
+                || config.output_rounding_radius == 0
                 || config.fitness_scale == 0
             {
                 bail!("当前版本返回了无效的 GPU 出生点配置");
@@ -936,8 +959,8 @@ mod tests {
     use super::{
         GPU_SPAWN_MAX_PERLINS, GpuCandidate, GpuPairPredicate, GpuPredicate, GpuSpawnConfig,
         GpuSpawnNoise, GpuSpawnPerlin, GpuStructureConfig, NativeContext, PieceAccuracy,
-        biome_by_name, biomes, gpu_spawn_config, piece_selector, pieces, spawn_origin_radius,
-        spawn_refinement_radius, structure_by_name, structures,
+        biome_by_name, biomes, end_gateway_gpu_margin, gpu_spawn_config, piece_selector, pieces,
+        spawn_origin_radius, spawn_refinement_radius, structure_by_name, structures,
     };
     use crate::domain::Dimension;
 
@@ -973,6 +996,7 @@ mod tests {
         assert!(config.perlin_count as usize <= GPU_SPAWN_MAX_PERLINS);
         assert_eq!((config.outer_radius, config.outer_step), (2_048, 512));
         assert_eq!((config.inner_radius, config.inner_step), (512, 32));
+        assert_eq!(config.output_rounding_radius, 12);
         assert_eq!(config.fitness_scale, 2_048 * 2_048);
         assert_eq!(
             config
@@ -982,6 +1006,26 @@ mod tests {
                 .sum::<u32>(),
             config.perlin_count
         );
+    }
+
+    #[test]
+    fn active_version_exposes_a_cached_first_end_gateway_exit() {
+        assert_eq!(
+            end_gateway_gpu_margin()
+                .expect("末地折跃门 GPU 能力")
+                .expect("当前版本应支持末地折跃门 GPU 包络"),
+            320
+        );
+        let mut context = NativeContext::new().expect("末地生成器");
+        context.set_seed(0);
+        let first = context.first_end_gateway_exit().expect("首个外岛出口");
+        let cached = context.first_end_gateway_exit().expect("缓存的外岛出口");
+        assert_eq!(cached, first);
+        context.set_seed(12_345);
+        let next_seed = context
+            .first_end_gateway_exit()
+            .expect("另一种子的外岛出口");
+        assert_ne!(next_seed, first);
     }
 
     #[test]
@@ -1188,6 +1232,9 @@ mod tests {
             ),
             (-32, -480)
         );
+
+        let gateway = context.first_end_gateway_exit().expect("首个外岛折跃门");
+        assert_eq!((gateway.x, gateway.z), (1028, -1));
 
         context.set_seed(-1);
         let negative_spawn = context.spawn().expect("负种子出生点");

@@ -56,6 +56,14 @@ int32_t mcseed_spawn_refinement_radius(uint32_t *radius);
 /** Return 1 and a strict origin-to-final-spawn horizontal bound when available. */
 int32_t mcseed_spawn_origin_radius(uint32_t *radius);
 
+/** Return the linked outer-island exit of the first post-dragon End gateway. */
+int32_t mcseed_first_end_gateway_exit(
+    McSeedContext *context,
+    McSeedHit *exit
+);
+/** Return 1 and the strict nominal-to-exact GPU gateway anchor bound. */
+int32_t mcseed_end_gateway_gpu_margin(uint32_t *radius);
+
 int32_t mcseed_biome_count(void);
 const char *mcseed_biome_name_at(int32_t index);
 int32_t mcseed_biome_id_at(int32_t index);

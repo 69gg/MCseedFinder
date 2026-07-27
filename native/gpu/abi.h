@@ -40,6 +40,7 @@ enum {
     MCSEED_GPU_ANCHOR_SPAWN = 1,
     MCSEED_GPU_ANCHOR_NETHER_SPAWN = 2,
     MCSEED_GPU_ANCHOR_COORDINATES = 3,
+    MCSEED_GPU_ANCHOR_END_GATEWAY = 4,
 };
 
 typedef struct McSeedGpuStructureConfig {
@@ -74,7 +75,9 @@ typedef struct McSeedGpuPairPredicate {
     uint32_t left_radius;
     uint32_t right_radius;
     uint32_t anchor_radius;
-    uint32_t reserved;
+    /* Low 5 bits: 0 keeps one dimension; 3 projects left coordinates / 8.
+     * High bits select grouped evaluation and the candidate-relative anchor. */
+    uint32_t left_coordinate_shift;
 } McSeedGpuPairPredicate;
 
 typedef struct McSeedGpuCandidate {
@@ -115,7 +118,8 @@ typedef struct McSeedGpuSpawnConfig {
     uint32_t outer_step;
     uint32_t inner_radius;
     uint32_t inner_step;
-    uint32_t reserved;
+    /* Maximum horizontal displacement caused by final chunk-centre rounding. */
+    uint32_t output_rounding_radius;
     uint64_t fitness_scale;
     McSeedGpuSpawnNoise noises[MCSEED_GPU_SPAWN_NOISE_COUNT];
     McSeedGpuSpawnPerlin perlins[MCSEED_GPU_SPAWN_MAX_PERLINS];

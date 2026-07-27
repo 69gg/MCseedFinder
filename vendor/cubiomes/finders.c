@@ -5534,8 +5534,8 @@ void getFixedEndGateways(int mc, uint64_t seed, Pos src[20])
         src[i] = fixed[ order[i] ];
 }
 
-Pos getLinkedGatewayChunk(const EndNoise *en, const SurfaceNoise *sn, uint64_t seed,
-    Pos src, Pos *dst)
+static Pos getLinkedGatewayChunkEx(const EndNoise *en, const SurfaceNoise *sn,
+    uint64_t seed, Pos src, Pos *dst, int *final_chunk_empty)
 {
     double invr = 1.0 / sqrt(src.x * src.x + src.z * src.z);
     double dx = src.x * invr;
@@ -5549,10 +5549,11 @@ Pos getLinkedGatewayChunk(const EndNoise *en, const SurfaceNoise *sn, uint64_t s
     Pos c;
     c.x = (int) floor(px) >> 4;
     c.z = (int) floor(pz) >> 4;
+    int chunk_empty = isEndChunkEmpty(en, sn, seed, c.x, c.z);
 
-    if (isEndChunkEmpty(en, sn, seed, c.x, c.z))
+    if (chunk_empty)
     {   // look forward for the first non-empty chunk
-        for (i = 0; i < 15; i++)
+        for (i = 0; i < 16; i++)
         {
             int qx = (int) floor(px += dx) >> 4;
             int qz = (int) floor(pz += dz) >> 4;
@@ -5560,13 +5561,14 @@ Pos getLinkedGatewayChunk(const EndNoise *en, const SurfaceNoise *sn, uint64_t s
                 continue;
             c.x = qx;
             c.z = qz;
-            if (!isEndChunkEmpty(en, sn, seed, c.x, c.z))
+            chunk_empty = isEndChunkEmpty(en, sn, seed, c.x, c.z);
+            if (!chunk_empty)
                 break;
         }
     }
     else
     {   // look backward for the last non-empty chunk
-        for (i = 0; i < 15; i++)
+        for (i = 0; i < 16; i++)
         {
             int qx = (int) floor(px -= dx) >> 4;
             int qz = (int) floor(pz -= dz) >> 4;
@@ -5578,10 +5580,19 @@ Pos getLinkedGatewayChunk(const EndNoise *en, const SurfaceNoise *sn, uint64_t s
     }
     if (dst)
     {
-        dst->x = (int) floor(px);
-        dst->z = (int) floor(pz);
+        double rounding = en->mc > MC_1_16 ? 0.5 : 0.0;
+        dst->x = (int) floor(px + rounding);
+        dst->z = (int) floor(pz + rounding);
     }
+    if (final_chunk_empty)
+        *final_chunk_empty = chunk_empty;
     return c;
+}
+
+Pos getLinkedGatewayChunk(const EndNoise *en, const SurfaceNoise *sn, uint64_t seed,
+    Pos src, Pos *dst)
+{
+    return getLinkedGatewayChunkEx(en, sn, seed, src, dst, NULL);
 }
 
 Pos getLinkedGatewayPos(const EndNoise *en, const SurfaceNoise *sn, uint64_t seed, Pos src)
@@ -5591,9 +5602,10 @@ Pos getLinkedGatewayPos(const EndNoise *en, const SurfaceNoise *sn, uint64_t see
     int i, j;
 
     Pos dst;
-    Pos c = getLinkedGatewayChunk(en, sn, seed, src, &dst);
+    int chunk_empty;
+    Pos c = getLinkedGatewayChunkEx(en, sn, seed, src, &dst, &chunk_empty);
 
-    if (en->mc > MC_1_16)
+    if (en->mc > MC_1_16 && !chunk_empty)
     {
         // The original java implementation has a bug where the result
         // variable for the in-chunk block search is assigned a reference
@@ -5643,6 +5655,42 @@ Pos getLinkedGatewayPos(const EndNoise *en, const SurfaceNoise *sn, uint64_t see
 
     mapEndSurfaceHeight(y, en, sn, sp.x, sp.z, 33, 33, 1, ymin);
     mapEndIslandHeight(y, en, seed, sp.x, sp.z, 33, 33, 1);
+
+    if (en->mc > MC_1_16 && chunk_empty)
+    {
+        /*
+         * Modern Minecraft creates an EndIslandFeature when all 16 outward
+         * chunks are empty. Its top layer is centred at the rounded tentative
+         * position at Y=75. Only that layer can affect findTallestBlock().
+         */
+        const uint64_t horizontal_mask = (UINT64_C(1) << 26) - 1;
+        uint64_t position_seed =
+            (((uint64_t)(uint32_t)dst.x & horizontal_mask) << 38) |
+            (((uint64_t)(uint32_t)dst.z & horizontal_mask) << 12) |
+            UINT64_C(75);
+        uint64_t random = 0;
+        int size;
+        setSeed(&random, position_seed);
+        size = nextInt(&random, 3) + 4;
+        for (i = -size; i <= size; i++)
+        {
+            for (j = -size; j <= size; j++)
+            {
+                int map_x;
+                int map_z;
+                int index;
+                if (i*i + j*j > (size+1)*(size+1))
+                    continue;
+                map_x = dst.x + i - sp.x;
+                map_z = dst.z + j - sp.z;
+                if (map_x < 0 || map_x >= 33 || map_z < 0 || map_z >= 33)
+                    continue;
+                index = map_z * 33 + map_x;
+                if (y[index] < 75)
+                    y[index] = 75;
+            }
+        }
+    }
 
     float v = -1;
     for (i = 0; i < 33; i++)

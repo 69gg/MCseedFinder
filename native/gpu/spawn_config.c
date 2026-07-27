@@ -207,6 +207,8 @@ int32_t mcseed_gpu_spawn_config(McSeedGpuSpawnConfig *config)
     config->outer_step = 512;
     config->inner_radius = 512;
     config->inner_step = 32;
+    /* (x & ~15) + 8 moves each axis by at most 8 blocks. */
+    config->output_rounding_radius = 12;
     config->fitness_scale = 2048ULL * 2048ULL;
     memcpy(config->targets, targets, sizeof(targets));
 

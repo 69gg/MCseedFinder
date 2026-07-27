@@ -77,6 +77,8 @@ static void assert_gpu_placements_match_cubiomes(void)
         UINT64_C(0),
         UINT64_MAX,
         UINT64_C(1),
+        UINT64_C(8),
+        UINT64_C(282),
         UINT64_C(0x8000000000000000),
         UINT64_C(0x0123456789abcdef),
         UINT64_C(0xfedcba9876543210),
@@ -160,6 +162,114 @@ static void assert_gpu_placements_match_cubiomes(void)
             gpu_config.kind == MCSEED_GPU_PLACEMENT_BASTION ||
             (gpu_config.flags & MCSEED_GPU_PLACEMENT_END_DISTANCE) != 0)
             assert(saw_invalid);
+    }
+}
+
+static void assert_first_end_gateway_anchor_is_conservative(void)
+{
+    static const uint64_t SEEDS[] = {
+        UINT64_C(0),
+        UINT64_MAX,
+        UINT64_C(1),
+        UINT64_C(8),
+        UINT64_C(282),
+        UINT64_C(0x8000000000000000),
+        UINT64_C(0x0123456789abcdef),
+        UINT64_C(0xfedcba9876543210),
+    };
+    McSeedContext *context = mcseed_context_create();
+    Generator generator;
+    uint32_t margin = 0;
+    size_t seed_index;
+    assert(context != NULL);
+    assert(mcseed_end_gateway_gpu_margin(&margin) == 1);
+    assert(margin == MCSEED_END_GATEWAY_GPU_MARGIN);
+    setupGenerator(&generator, MCSEED_CUBIOMES_VERSION, 0);
+
+    for (seed_index = 0; seed_index < sizeof(SEEDS) / sizeof(SEEDS[0]); seed_index++) {
+        Pos gateways[MCSEED_END_GATEWAY_COUNT];
+        SurfaceNoise surface_noise;
+        McSeedGpuPosition nominal;
+        McSeedHit actual;
+        Pos expected;
+        int64_t dx;
+        int64_t dz;
+
+        applySeed(&generator, DIM_END, SEEDS[seed_index]);
+        initSurfaceNoise(&surface_noise, DIM_END, SEEDS[seed_index]);
+        getFixedEndGateways(MCSEED_CUBIOMES_VERSION, SEEDS[seed_index], gateways);
+        expected = getLinkedGatewayPos(
+            &generator.en,
+            &surface_noise,
+            SEEDS[seed_index],
+            gateways[0]
+        );
+
+        mcseed_context_set_seed(context, SEEDS[seed_index]);
+        assert(mcseed_first_end_gateway_exit(context, &actual) == 0);
+        assert(actual.x == expected.x && actual.z == expected.z);
+        nominal = mcseed_gpu_first_end_gateway_nominal(SEEDS[seed_index]);
+        dx = (int64_t)actual.x - nominal.x;
+        dz = (int64_t)actual.z - nominal.z;
+        assert(dx * dx + dz * dz <= (int64_t)margin * margin);
+    }
+
+    mcseed_context_destroy(context);
+}
+
+static void assert_end_gateway_ray_and_empty_island_regressions(void)
+{
+    static const struct {
+        uint64_t seed;
+        Pos source;
+        Pos chunk;
+        Pos tentative;
+        Pos linked;
+        int final_chunk_empty;
+    } CASES[] = {
+        {UINT64_C(8), {29, 91}, {24, 76}, {389, 1220}, {392, 1225}, 0},
+        {UINT64_C(282), {56, 77}, {47, 64}, {753, 1035}, {749, 1032}, 1},
+    };
+    size_t case_index;
+    for (case_index = 0; case_index < sizeof(CASES) / sizeof(CASES[0]); case_index++) {
+        const uint64_t seed = CASES[case_index].seed;
+        EndNoise end_noise;
+        SurfaceNoise surface_noise;
+        Pos gateways[MCSEED_END_GATEWAY_COUNT];
+        Pos tentative;
+        Pos chunk;
+        Pos linked;
+        setEndSeed(&end_noise, MCSEED_CUBIOMES_VERSION, seed);
+        initSurfaceNoise(&surface_noise, DIM_END, seed);
+        getFixedEndGateways(MCSEED_CUBIOMES_VERSION, seed, gateways);
+        assert(gateways[0].x == CASES[case_index].source.x);
+        assert(gateways[0].z == CASES[case_index].source.z);
+        chunk = getLinkedGatewayChunk(
+            &end_noise,
+            &surface_noise,
+            seed,
+            gateways[0],
+            &tentative
+        );
+        assert(chunk.x == CASES[case_index].chunk.x);
+        assert(chunk.z == CASES[case_index].chunk.z);
+        assert(tentative.x == CASES[case_index].tentative.x);
+        assert(tentative.z == CASES[case_index].tentative.z);
+        assert(isEndChunkEmpty(
+            &end_noise,
+            &surface_noise,
+            seed,
+            chunk.x,
+            chunk.z
+        ) == CASES[case_index].final_chunk_empty);
+        linked = getLinkedGatewayPos(
+            &end_noise,
+            &surface_noise,
+            seed,
+            gateways[0]
+        );
+        assert(linked.x == CASES[case_index].linked.x);
+        assert(linked.z == CASES[case_index].linked.z);
     }
 }
 
@@ -348,6 +458,8 @@ int main(void)
 
     assert_btree262_indices_are_in_bounds();
     assert_gpu_placements_match_cubiomes();
+    assert_first_end_gateway_anchor_is_conservative();
+    assert_end_gateway_ray_and_empty_island_regressions();
     assert_village_centers_match_cubiomes_variant();
     assert(mcseed_biome_count() > 50);
     assert(mcseed_structure_count() == 22);
